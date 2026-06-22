@@ -7,14 +7,15 @@
 use crate::app_config::{AppType, InstalledSkill, UnmanagedSkill};
 use crate::error::format_skill_error;
 use crate::services::skill::{
-    DiscoverableSkill, ImportSkillSelection, MigrationResult, Skill, SkillBackupEntry, SkillRepo,
-    SkillService, SkillStorageLocation, SkillUninstallResult, SkillUpdateInfo,
-    SkillsShSearchResult,
+    DiscoverableSkill, ImportSkillSelection, MigrationResult, Skill, SkillBackupEntry,
+    SkillOpenTarget, SkillRepo, SkillService, SkillStorageLocation, SkillUninstallResult,
+    SkillUpdateInfo, SkillsShSearchResult,
 };
 use crate::store::AppState;
 use std::str::FromStr;
 use std::sync::Arc;
-use tauri::State;
+use tauri::{AppHandle, State};
+use tauri_plugin_opener::OpenerExt;
 
 /// SkillService 状态包装
 pub struct SkillServiceState(pub Arc<SkillService>);
@@ -30,6 +31,35 @@ fn parse_app_type(app: &str) -> Result<AppType, String> {
 #[tauri::command]
 pub fn get_installed_skills(app_state: State<'_, AppState>) -> Result<Vec<InstalledSkill>, String> {
     SkillService::get_all_installed(&app_state.db).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn get_skill_open_targets() -> Result<Vec<SkillOpenTarget>, String> {
+    Ok(SkillService::get_skill_open_targets())
+}
+
+#[tauri::command]
+pub fn open_skill_directory(
+    handle: AppHandle,
+    id: String,
+    #[allow(non_snake_case)] targetId: Option<String>,
+    app_state: State<'_, AppState>,
+) -> Result<bool, String> {
+    let (skill_dir, target) =
+        SkillService::resolve_skill_open_request(&app_state.db, &id, targetId.as_deref())
+            .map_err(|e| e.to_string())?;
+
+    if target.is_system() {
+        handle
+            .opener()
+            .open_path(skill_dir.to_string_lossy().to_string(), None::<String>)
+            .map_err(|e| format!("打开 Skill 目录失败: {e}"))?;
+    } else {
+        SkillService::open_skill_directory_with_target(&skill_dir, &target)
+            .map_err(|e| e.to_string())?;
+    }
+
+    Ok(true)
 }
 
 #[tauri::command]

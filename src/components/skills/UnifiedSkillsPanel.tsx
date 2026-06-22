@@ -6,6 +6,8 @@ import {
   ExternalLink,
   RefreshCw,
   Loader2,
+  FolderOpen,
+  ChevronDown,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -24,9 +26,11 @@ import {
   useInstallSkillsFromZip,
   useCheckSkillUpdates,
   useUpdateSkill,
+  useSkillOpenTargets,
   type InstalledSkill,
   type SkillUpdateInfo,
 } from "@/hooks/useSkills";
+import type { SkillOpenTarget } from "@/lib/api/skills";
 import type { AppId } from "@/lib/api/types";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { settingsApi, skillsApi } from "@/lib/api";
@@ -43,6 +47,12 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 
 interface UnifiedSkillsPanelProps {
   onOpenDiscovery: () => void;
@@ -100,7 +110,11 @@ const UnifiedSkillsPanel = React.forwardRef<
     isFetching: isCheckingUpdates,
   } = useCheckSkillUpdates();
   const updateSkillMutation = useUpdateSkill();
+  const { data: skillOpenTargets = [] } = useSkillOpenTargets();
   const [isUpdatingAll, setIsUpdatingAll] = useState(false);
+  const [openingSkillTarget, setOpeningSkillTarget] = useState<string | null>(
+    null,
+  );
 
   const updatesMap = useMemo(() => {
     const map: Record<string, SkillUpdateInfo> = {};
@@ -305,6 +319,26 @@ const UnifiedSkillsPanel = React.forwardRef<
     }
   };
 
+  const handleOpenSkillDirectory = async (
+    skill: InstalledSkill,
+    targetId?: string,
+  ) => {
+    const key = `${skill.id}:${targetId || "auto"}`;
+    setOpeningSkillTarget(key);
+    try {
+      await skillsApi.openDirectory(skill.id, targetId);
+      toast.success(t("skills.openDirectorySuccess", { name: skill.name }), {
+        closeButton: true,
+      });
+    } catch (error) {
+      toast.error(t("skills.openDirectoryFailed"), {
+        description: String(error),
+      });
+    } finally {
+      setOpeningSkillTarget(null);
+    }
+  };
+
   const handleDeleteBackup = (backup: SkillBackupEntry) => {
     setConfirmDialog({
       isOpen: true,
@@ -431,6 +465,11 @@ const UnifiedSkillsPanel = React.forwardRef<
                   onToggleApp={handleToggleApp}
                   onUninstall={() => handleUninstall(skill)}
                   onUpdate={() => handleUpdateSkill(skill)}
+                  openTargets={skillOpenTargets}
+                  openingTarget={openingSkillTarget}
+                  onOpenDirectory={(targetId) =>
+                    handleOpenSkillDirectory(skill, targetId)
+                  }
                   isLast={index === skills.length - 1}
                 />
               ))}
@@ -484,6 +523,9 @@ interface InstalledSkillListItemProps {
   onToggleApp: (id: string, app: AppId, enabled: boolean) => void;
   onUninstall: () => void;
   onUpdate?: () => void;
+  openTargets: SkillOpenTarget[];
+  openingTarget: string | null;
+  onOpenDirectory: (targetId?: string) => void;
   isLast?: boolean;
 }
 
@@ -494,9 +536,16 @@ const InstalledSkillListItem: React.FC<InstalledSkillListItemProps> = ({
   onToggleApp,
   onUninstall,
   onUpdate,
+  openTargets,
+  openingTarget,
+  onOpenDirectory,
   isLast,
 }) => {
   const { t } = useTranslation();
+  const isOpeningAuto = openingTarget === `${skill.id}:auto`;
+  const isOpeningAny = Boolean(
+    openingTarget && openingTarget.startsWith(`${skill.id}:`),
+  );
 
   const openDocs = async () => {
     if (!skill.readmeUrl) return;
@@ -562,6 +611,47 @@ const InstalledSkillListItem: React.FC<InstalledSkillListItemProps> = ({
         className="flex-shrink-0 flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
         style={hasUpdate ? { opacity: 1 } : undefined}
       >
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon"
+          className="h-7 w-7 hover:text-blue-500 hover:bg-blue-100 dark:hover:text-blue-400 dark:hover:bg-blue-500/10"
+          onClick={() => onOpenDirectory()}
+          disabled={isOpeningAny}
+          title={t("skills.openDirectory")}
+        >
+          {isOpeningAuto ? (
+            <Loader2 size={14} className="animate-spin" />
+          ) : (
+            <FolderOpen size={14} />
+          )}
+        </Button>
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="h-7 w-6 hover:text-blue-500 hover:bg-blue-100 dark:hover:text-blue-400 dark:hover:bg-blue-500/10"
+              disabled={isOpeningAny || openTargets.length === 0}
+              title={t("skills.openDirectoryWith")}
+            >
+              <ChevronDown size={12} />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="min-w-40">
+            {openTargets.map((target) => (
+              <DropdownMenuItem
+                key={target.id}
+                onSelect={() => onOpenDirectory(target.id)}
+              >
+                {target.id === "system"
+                  ? t("skills.openDirectorySystem")
+                  : target.label}
+              </DropdownMenuItem>
+            ))}
+          </DropdownMenuContent>
+        </DropdownMenu>
         {hasUpdate && onUpdate && (
           <Button
             type="button"
