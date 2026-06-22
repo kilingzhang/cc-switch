@@ -38,6 +38,14 @@ export function useSkillBackups() {
   });
 }
 
+export function useSkillOpenTargets() {
+  return useQuery({
+    queryKey: ["skills", "openTargets"],
+    queryFn: () => skillsApi.getOpenTargets(),
+    staleTime: 5 * 60 * 1000,
+  });
+}
+
 export function useDeleteSkillBackup() {
   const queryClient = useQueryClient();
   return useMutation({
