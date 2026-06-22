@@ -97,6 +97,11 @@ export interface SkillUpdateInfo {
   remoteHash: string;
 }
 
+export interface SkillOpenTarget {
+  id: string;
+  label: string;
+}
+
 /** 存储位置迁移结果 */
 export interface MigrationResult {
   migratedCount: number;
@@ -139,6 +144,16 @@ export const skillsApi = {
   /** 获取所有已安装的 Skills */
   async getInstalled(): Promise<InstalledSkill[]> {
     return await invoke("get_installed_skills");
+  },
+
+  /** 获取可用于打开 Skill 目录的编辑器/系统目标 */
+  async getOpenTargets(): Promise<SkillOpenTarget[]> {
+    return await invoke("get_skill_open_targets");
+  },
+
+  /** 打开已安装 Skill 的本地目录 */
+  async openDirectory(id: string, targetId?: string): Promise<boolean> {
+    return await invoke("open_skill_directory", { id, targetId });
   },
 
   /** 获取可恢复的 Skill 备份列表 */

@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::timeout;
@@ -185,6 +186,66 @@ pub struct SkillUpdateInfo {
     /// 远程最新哈希
     pub remote_hash: String,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SkillOpenTargetKind {
+    Cli {
+        command: &'static str,
+    },
+    #[cfg(target_os = "macos")]
+    MacApp {
+        app_name: &'static str,
+    },
+    System,
+}
+
+/// 可用于打开 Skill 目录的目标。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillOpenTarget {
+    pub id: String,
+    pub label: String,
+    #[serde(skip_serializing)]
+    kind: SkillOpenTargetKind,
+}
+
+impl SkillOpenTarget {
+    pub fn is_system(&self) -> bool {
+        matches!(self.kind, SkillOpenTargetKind::System)
+    }
+}
+
+struct SkillEditorCandidate {
+    id: &'static str,
+    label: &'static str,
+    command: &'static str,
+    #[cfg(target_os = "macos")]
+    mac_app_name: &'static str,
+}
+
+const EDITOR_CANDIDATES: &[SkillEditorCandidate] = &[
+    SkillEditorCandidate {
+        id: "zed",
+        label: "Zed",
+        command: "zed",
+        #[cfg(target_os = "macos")]
+        mac_app_name: "Zed",
+    },
+    SkillEditorCandidate {
+        id: "code",
+        label: "VS Code",
+        command: "code",
+        #[cfg(target_os = "macos")]
+        mac_app_name: "Visual Studio Code",
+    },
+    SkillEditorCandidate {
+        id: "cursor",
+        label: "Cursor",
+        command: "cursor",
+        #[cfg(target_os = "macos")]
+        mac_app_name: "Cursor",
+    },
+];
 
 /// Skill 存储位置迁移结果
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -562,6 +623,157 @@ impl SkillService {
     pub fn get_all_installed(db: &Arc<Database>) -> Result<Vec<InstalledSkill>> {
         let skills = db.get_all_installed_skills()?;
         Ok(skills.into_values().collect())
+    }
+
+    pub fn get_skill_open_targets() -> Vec<SkillOpenTarget> {
+        let available = EDITOR_CANDIDATES
+            .iter()
+            .filter(|candidate| Self::command_exists(candidate.command))
+            .map(|candidate| candidate.command.to_string())
+            .collect::<Vec<_>>();
+
+        let mut targets = Self::skill_open_targets_from_available_commands(&available);
+
+        #[cfg(target_os = "macos")]
+        {
+            for candidate in EDITOR_CANDIDATES {
+                if targets.iter().any(|target| target.id == candidate.id) {
+                    continue;
+                }
+                if Self::mac_app_exists(candidate.mac_app_name) {
+                    let system = targets.pop();
+                    targets.push(SkillOpenTarget {
+                        id: candidate.id.to_string(),
+                        label: candidate.label.to_string(),
+                        kind: SkillOpenTargetKind::MacApp {
+                            app_name: candidate.mac_app_name,
+                        },
+                    });
+                    if let Some(system) = system {
+                        targets.push(system);
+                    }
+                }
+            }
+        }
+
+        targets
+    }
+
+    fn command_exists(command: &str) -> bool {
+        Command::new(command)
+            .arg("--version")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn mac_app_exists(app_name: &str) -> bool {
+        let candidates = [
+            PathBuf::from("/Applications").join(format!("{app_name}.app")),
+            dirs::home_dir()
+                .unwrap_or_default()
+                .join("Applications")
+                .join(format!("{app_name}.app")),
+        ];
+
+        candidates.iter().any(|path| path.is_dir())
+    }
+
+    fn skill_open_targets_from_available_commands(commands: &[String]) -> Vec<SkillOpenTarget> {
+        let mut targets = Vec::new();
+
+        for candidate in EDITOR_CANDIDATES {
+            if commands.iter().any(|command| command == candidate.command) {
+                targets.push(SkillOpenTarget {
+                    id: candidate.id.to_string(),
+                    label: candidate.label.to_string(),
+                    kind: SkillOpenTargetKind::Cli {
+                        command: candidate.command,
+                    },
+                });
+            }
+        }
+
+        targets.push(SkillOpenTarget {
+            id: "system".to_string(),
+            label: "System Default".to_string(),
+            kind: SkillOpenTargetKind::System,
+        });
+
+        targets
+    }
+
+    fn resolve_skill_open_target(
+        targets: &[SkillOpenTarget],
+        target_id: Option<&str>,
+    ) -> Result<SkillOpenTarget> {
+        if let Some(target_id) = target_id.map(str::trim).filter(|value| !value.is_empty()) {
+            return targets
+                .iter()
+                .find(|target| target.id == target_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("Skill editor is not available: {target_id}"));
+        }
+
+        targets
+            .iter()
+            .find(|target| !matches!(target.kind, SkillOpenTargetKind::System))
+            .or_else(|| targets.iter().find(|target| target.id == "system"))
+            .cloned()
+            .ok_or_else(|| anyhow!("No skill open target is available"))
+    }
+
+    fn resolve_skill_directory_in_root(root: &Path, directory: &str) -> Result<PathBuf> {
+        let relative = Self::sanitize_skill_source_path(directory)
+            .ok_or_else(|| anyhow!("Invalid skill directory: {directory}"))?;
+        let skill_dir = root.join(relative);
+
+        Self::validate_sync_source_dir(&skill_dir, directory)?;
+        Ok(skill_dir)
+    }
+
+    pub fn resolve_installed_skill_directory(db: &Arc<Database>, id: &str) -> Result<PathBuf> {
+        let skill = db
+            .get_installed_skill(id)?
+            .ok_or_else(|| anyhow!("Skill not found: {id}"))?;
+        let ssot_dir = Self::get_ssot_dir()?;
+        Self::resolve_skill_directory_in_root(&ssot_dir, &skill.directory)
+    }
+
+    pub fn resolve_skill_open_request(
+        db: &Arc<Database>,
+        id: &str,
+        target_id: Option<&str>,
+    ) -> Result<(PathBuf, SkillOpenTarget)> {
+        let skill_dir = Self::resolve_installed_skill_directory(db, id)?;
+        let targets = Self::get_skill_open_targets();
+        let target = Self::resolve_skill_open_target(&targets, target_id)?;
+        Ok((skill_dir, target))
+    }
+
+    pub fn open_skill_directory_with_target(path: &Path, target: &SkillOpenTarget) -> Result<()> {
+        match &target.kind {
+            SkillOpenTargetKind::Cli { command } => {
+                Command::new(command)
+                    .arg(path)
+                    .spawn()
+                    .with_context(|| format!("Failed to open skill with {}", target.label))?;
+            }
+            #[cfg(target_os = "macos")]
+            SkillOpenTargetKind::MacApp { app_name } => {
+                Command::new("open")
+                    .args(["-a", app_name])
+                    .arg(path)
+                    .spawn()
+                    .with_context(|| format!("Failed to open skill with {}", target.label))?;
+            }
+            SkillOpenTargetKind::System => {
+                return Err(anyhow!("system opener must be handled by the Tauri opener"));
+            }
+        }
+
+        Ok(())
     }
 
     /// 安装 Skill
@@ -3122,6 +3334,61 @@ mod tests {
         assert!(
             dest.join("SKILL.md").is_file(),
             "existing destination skill should be preserved"
+        );
+    }
+
+    #[test]
+    fn skill_editor_auto_prefers_zed_before_vscode_and_cursor() {
+        let targets = SkillService::skill_open_targets_from_available_commands(&[
+            "cursor".to_string(),
+            "code".to_string(),
+            "zed".to_string(),
+        ]);
+
+        let auto = SkillService::resolve_skill_open_target(&targets, None)
+            .expect("auto target should resolve");
+
+        assert_eq!(auto.id, "zed");
+        assert_eq!(targets[0].id, "zed");
+        assert_eq!(targets[1].id, "code");
+        assert_eq!(targets[2].id, "cursor");
+        assert_eq!(targets.last().expect("system target").id, "system");
+    }
+
+    #[test]
+    fn skill_editor_rejects_unavailable_explicit_editor() {
+        let targets =
+            SkillService::skill_open_targets_from_available_commands(&["code".to_string()]);
+
+        let err = SkillService::resolve_skill_open_target(&targets, Some("zed"))
+            .expect_err("unavailable explicit editor should fail");
+
+        assert!(err.to_string().contains("zed"), "unexpected error: {err:#}");
+    }
+
+    #[test]
+    fn skill_editor_validates_skill_directory_contains_manifest() {
+        let temp = tempdir().expect("tempdir");
+        write_skill(&temp.path().join("valid-skill"), "Valid Skill");
+        fs::create_dir_all(temp.path().join("empty-skill")).expect("create empty skill");
+
+        let valid = SkillService::resolve_skill_directory_in_root(temp.path(), "valid-skill")
+            .expect("valid skill should resolve");
+        assert_eq!(valid, temp.path().join("valid-skill"));
+
+        let missing_manifest =
+            SkillService::resolve_skill_directory_in_root(temp.path(), "empty-skill")
+                .expect_err("missing SKILL.md should fail");
+        assert!(
+            missing_manifest.to_string().contains("SKILL.md"),
+            "unexpected error: {missing_manifest:#}"
+        );
+
+        let missing = SkillService::resolve_skill_directory_in_root(temp.path(), "missing-skill")
+            .expect_err("missing skill should fail");
+        assert!(
+            missing.to_string().contains("missing-skill"),
+            "unexpected error: {missing:#}"
         );
     }
 }
