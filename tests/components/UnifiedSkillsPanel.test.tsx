@@ -57,6 +57,9 @@ vi.mock("@/hooks/useSkills", () => ({
     refetch: vi.fn(),
     isFetching: false,
   }),
+  useSkillOpenTargets: () => ({
+    data: [],
+  }),
   useDeleteSkillBackup: () => ({
     mutateAsync: deleteSkillBackupMock,
     isPending: false,
