@@ -3,6 +3,13 @@
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_updater::UpdaterExt;
 
+/// 应用更新下载进度（通过 `update-download-progress` 事件发给前端）。
+#[derive(Clone, serde::Serialize)]
+struct UpdateDownloadProgress {
+    downloaded: u64,
+    total: Option<u64>,
+}
+
 fn merge_settings_for_save(
     mut incoming: crate::settings::AppSettings,
     existing: &crate::settings::AppSettings,
@@ -220,16 +227,17 @@ pub async fn install_update_and_restart(app: AppHandle) -> Result<bool, String> 
     };
 
     log::info!("开始下载应用更新: {}", update.version);
-
-    let app_handle = app.clone();
+    let progress_handle = app.clone();
+    let mut downloaded: u64 = 0;
     let download_future = update.download(
-        move |chunk_length, content_length| {
-            let _ = app_handle.emit(
+        move |chunk_len, content_len| {
+            downloaded = downloaded.saturating_add(chunk_len as u64);
+            let _ = progress_handle.emit(
                 "update-download-progress",
-                serde_json::json!({
-                    "chunkLength": chunk_length,
-                    "contentLength": content_length,
-                }),
+                UpdateDownloadProgress {
+                    downloaded,
+                    total: content_len,
+                },
             );
         },
         || {},
@@ -281,6 +289,24 @@ pub async fn install_update_and_restart(app: AppHandle) -> Result<bool, String> 
         //   - 代理/Live 配置：重启后新实例立即接管并恢复代理状态，无需手动清理
         crate::restart_process(&app);
     }
+}
+
+/// 检查是否有可用的应用更新，返回可用的新版本号（无更新时返回 None）。
+///
+/// 数据库版本过新的恢复界面用它判断：升级应用能否解决问题。若返回 None，说明
+/// 已是最新版本，但数据库仍不兼容（通常由第三方客户端或更高版本创建），应提示用户
+/// 升级无法解决，而不是让其反复尝试。
+#[tauri::command]
+pub async fn check_app_update_available(app: AppHandle) -> Result<Option<String>, String> {
+    let updater = app
+        .updater_builder()
+        .build()
+        .map_err(|e| format!("初始化更新器失败: {e}"))?;
+    let update = updater
+        .check()
+        .await
+        .map_err(|e| format!("检查更新失败: {e}"))?;
+    Ok(update.map(|u| u.version))
 }
 
 /// 获取 app_config_dir 覆盖配置 (从 Store)
