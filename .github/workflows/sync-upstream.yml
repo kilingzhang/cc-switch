@@ -93,11 +93,20 @@ jobs:
           TARGET="${{ steps.vars.outputs.target_branch }}"
           DATE=$(date -u +"%Y-%m-%d")
           PR_BRANCH="sync/upstream-main/$DATE"
-          # 基于目标分支创建同步分支，在上面做 merge（保留冲突状态供 PR 解决）
+          # 基于目标分支创建同步分支，在上面做 merge
           git checkout -b "$PR_BRANCH"
           git merge upstream/main --no-edit || true
-          # 即使有冲突也 push（force-with-lease 安全），GitHub 会识别为可解决冲突的 PR
+          # 关键：冲突时 merge 不会自动 commit，PR 分支与 base 无差异无法开 PR。
+          # 这里把冲突状态强制 commit 上去（保留冲突标记），让 PR 能展示冲突文件，
+          # 人工在 PR 里或本地解决。
+          if git diff --check >/dev/null 2>&1 && ! git diff --cached --quiet 2>/dev/null; then
+            : # 无未解决冲突，正常已 commit
+          else
+            git add -A || true
+            git commit -m "merge upstream/main (conflicts unresolved, needs manual resolution)" --no-verify || true
+          fi
           git push --force-with-lease origin "$PR_BRANCH"
+          # 不用 --label（label 可能不存在导致 create 失败）；错误直接抛出便于排查
           gh pr create \
             --base "$TARGET" \
             --head "$PR_BRANCH" \
@@ -105,23 +114,22 @@ jobs:
             --body "$(cat <<BODY
           自动同步检测到 \`upstream/main\` 有新提交，但合并到 \`$TARGET\` 时产生冲突。
 
-          ## 需要手动解决的冲突
-
-          请在本地或 GitHub 网页端解决冲突后合并此 PR。
+          ## 冲突文件
 
           \`\`\`bash
           git fetch origin
           git checkout $PR_BRANCH
-          git merge upstream/main
-          # 解决冲突...
+          # 查看冲突
+          git diff --name-only --diff-filter=U
+          # 解决冲突后
           git add . && git commit
           git push
           \`\`\`
 
           上游新增提交见 run summary。
           BODY
-          )" \
-            --label "sync" 2>/dev/null || true
-          echo "📋 Opened conflict PR against $TARGET." >> $GITHUB_STEP_SUMMARY
+          )"
+          PR_URL=$(gh pr view --json url -q .url 2>/dev/null || echo "")
+          echo "📋 Opened conflict PR: $PR_URL" >> $GITHUB_STEP_SUMMARY
         env:
           GH_TOKEN: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
