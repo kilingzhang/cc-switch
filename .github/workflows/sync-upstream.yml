@@ -3,16 +3,16 @@ name: Sync upstream main
 # 每天定时检查 upstream/main（farion1231/cc-switch）是否有新提交，
 # 自动合并到 feature/07：
 # - 无冲突：自动 merge + push
-# - 有冲突：自动开 PR，通知人工解决
+# - 有冲突：推送 conflict 分支 + 开 Issue 通知（附冲突文件和解决命令）
 #
 # 触发方式：
-# 1. schedule: 每天 UTC 18:00（北京时间凌晨 2:00）
+# 1. schedule: 每天 UTC 18:00（北京时间 02:00）
 # 2. workflow_dispatch: 手动在 Actions 页面触发
 #
-# 权限要求：
-# - workflows 默认用 GITHUB_TOKEN，但它的 push 不会触发其他 workflow。
-#   如需 push 后触发 CI，请用 PAT（创建后加为仓库 secret SYNC_TOKEN）。
-#   不配 SYNC_TOKEN 时回退到默认 GITHUB_TOKEN（仅 push 不触发 CI）。
+# 权限说明：
+# - push 分支：默认 GITHUB_TOKEN 即可
+# - 开 Issue 通知：默认 GITHUB_TOKEN 即可（fork 仓库的 GITHUB_TOKEN 不能创建 PR，
+#   所以用 Issue 通知代替；如配了 SYNC_TOKEN/PAT 则优先用它）
 
 on:
   schedule:
@@ -87,7 +87,7 @@ jobs:
           git push origin ${{ steps.vars.outputs.target_branch }}
           echo "🚀 Pushed merged ${{ steps.vars.outputs.target_branch }}." >> $GITHUB_STEP_SUMMARY
 
-      - name: Create PR (on conflict)
+      - name: Handle conflict (push branch + open issue)
         if: steps.merge.outputs.merge_ok == 'false'
         run: |
           TARGET="${{ steps.vars.outputs.target_branch }}"
@@ -96,40 +96,52 @@ jobs:
           # 基于目标分支创建同步分支，在上面做 merge
           git checkout -b "$PR_BRANCH"
           git merge upstream/main --no-edit || true
-          # 关键：冲突时 merge 不会自动 commit，PR 分支与 base 无差异无法开 PR。
-          # 这里把冲突状态强制 commit 上去（保留冲突标记），让 PR 能展示冲突文件，
-          # 人工在 PR 里或本地解决。
-          if git diff --check >/dev/null 2>&1 && ! git diff --cached --quiet 2>/dev/null; then
-            : # 无未解决冲突，正常已 commit
-          else
-            git add -A || true
-            git commit -m "merge upstream/main (conflicts unresolved, needs manual resolution)" --no-verify || true
-          fi
+          # 冲突时强制 commit（保留冲突标记），让分支有实际内容便于人工 diff
+          git add -A || true
+          git commit -m "merge upstream/main (conflicts unresolved, needs manual resolution)" --no-verify || true
           git push --force-with-lease origin "$PR_BRANCH"
-          # 不用 --label（label 可能不存在导致 create 失败）；错误直接抛出便于排查
-          gh pr create \
-            --base "$TARGET" \
-            --head "$PR_BRANCH" \
-            --title "chore: sync upstream/main ($DATE) — 需手动解决冲突" \
+          # 收集冲突文件列表
+          CONFLICT_FILES=$(git diff --name-only --diff-filter=U HEAD~1 HEAD 2>/dev/null || echo "(见 diff)")
+          # 收集上游新增提交
+          UPSTREAM_LOG=$(git log --oneline HEAD..upstream/main 2>/dev/null | head -20 || echo "")
+          # 开 Issue 通知（GITHUB_TOKEN 即可，无需 PAT）
+          gh issue create \
+            --title "⚠️ upstream/main 同步冲突 ($DATE) — 需手动解决" \
             --body "$(cat <<BODY
           自动同步检测到 \`upstream/main\` 有新提交，但合并到 \`$TARGET\` 时产生冲突。
 
-          ## 冲突文件
+          ## 冲突分支
+          \`$PR_BRANCH\`（已推送到远端，包含未解决冲突的 merge commit）
 
-          \`\`\`bash
-          git fetch origin
-          git checkout $PR_BRANCH
-          # 查看冲突
-          git diff --name-only --diff-filter=U
-          # 解决冲突后
-          git add . && git commit
-          git push
+          ## 冲突文件
+          \`\`\`
+          $CONFLICT_FILES
           \`\`\`
 
-          上游新增提交见 run summary。
+          ## 解决步骤
+          \`\`\`bash
+          git fetch origin
+          git checkout $TARGET
+          git merge upstream/main
+          # 解决上述文件的冲突...
+          git add .
+          git commit
+          git push origin $TARGET
+          \`\`\`
+
+          ## 上游新增提交
+          \`\`\`
+          $UPSTREAM_LOG
+          \`\`\`
+
+          解决后可关闭此 Issue，并删除临时分支：
+          \`git push origin --delete $PR_BRANCH\`
           BODY
-          )"
-          PR_URL=$(gh pr view --json url -q .url 2>/dev/null || echo "")
-          echo "📋 Opened conflict PR: $PR_URL" >> $GITHUB_STEP_SUMMARY
+          )" \
+            --label "sync,conflict" 2>/dev/null || \
+          gh issue create \
+            --title "⚠️ upstream/main 同步冲突 ($DATE) — 需手动解决" \
+            --body "见 workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "📋 Opened conflict issue for $TARGET." >> $GITHUB_STEP_SUMMARY
         env:
           GH_TOKEN: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
