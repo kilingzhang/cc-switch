@@ -2,17 +2,17 @@ name: Sync upstream main
 
 # 每天定时检查 upstream/main（farion1231/cc-switch）是否有新提交，
 # 自动合并到 feature/07：
-# - 无冲突：自动 merge + push
-# - 有冲突：推送 conflict 分支 + 开 Issue 通知（附冲突文件和解决命令）
+# - 无冲突：自动 merge + push（静默完成）
+# - 有冲突：推送 conflict 分支 + 把冲突文件/解决命令写进 run summary，
+#   并让 run 失败触发 GitHub 邮件通知。
 #
 # 触发方式：
 # 1. schedule: 每天 UTC 18:00（北京时间 02:00）
 # 2. workflow_dispatch: 手动在 Actions 页面触发
 #
-# 权限说明：
-# - push 分支：默认 GITHUB_TOKEN 即可
-# - 开 Issue 通知：默认 GITHUB_TOKEN 即可（fork 仓库的 GITHUB_TOKEN 不能创建 PR，
-#   所以用 Issue 通知代替；如配了 SYNC_TOKEN/PAT 则优先用它）
+# 为什么不开 PR/Issue：fork 仓库的 GITHUB_TOKEN 受 GitHub 限制，
+# 无法 createPullRequest / createIssue（Resource not accessible）。
+# 如需自动开 PR，请配 SYNC_TOKEN（Fine-grained PAT，给本仓库 contents+PR 权限）。
 
 on:
   schedule:
@@ -88,7 +88,7 @@ jobs:
           git push origin ${{ steps.vars.outputs.target_branch }}
           echo "🚀 Pushed merged ${{ steps.vars.outputs.target_branch }}." >> $GITHUB_STEP_SUMMARY
 
-      - name: Handle conflict (push branch + open issue)
+      - name: Handle conflict (push branch + fail run for email alert)
         if: steps.merge.outputs.merge_ok == 'false'
         run: |
           TARGET="${{ steps.vars.outputs.target_branch }}"
@@ -97,52 +97,43 @@ jobs:
           # 基于目标分支创建同步分支，在上面做 merge
           git checkout -b "$PR_BRANCH"
           git merge upstream/main --no-edit || true
-          # 冲突时强制 commit（保留冲突标记），让分支有实际内容便于人工 diff
+          # 冲突时强制 commit（保留冲突标记），推到远端供人工 diff
           git add -A || true
           git commit -m "merge upstream/main (conflicts unresolved, needs manual resolution)" --no-verify || true
           git push --force-with-lease origin "$PR_BRANCH"
           # 收集冲突文件列表
-          CONFLICT_FILES=$(git diff --name-only --diff-filter=U HEAD~1 HEAD 2>/dev/null || echo "(见 diff)")
-          # 收集上游新增提交
-          UPSTREAM_LOG=$(git log --oneline HEAD..upstream/main 2>/dev/null | head -20 || echo "")
-          # 开 Issue 通知（GITHUB_TOKEN 即可，无需 PAT）
-          gh issue create \
-            --title "⚠️ upstream/main 同步冲突 ($DATE) — 需手动解决" \
-            --body "$(cat <<BODY
-          自动同步检测到 \`upstream/main\` 有新提交，但合并到 \`$TARGET\` 时产生冲突。
-
-          ## 冲突分支
-          \`$PR_BRANCH\`（已推送到远端，包含未解决冲突的 merge commit）
-
-          ## 冲突文件
-          \`\`\`
-          $CONFLICT_FILES
-          \`\`\`
-
-          ## 解决步骤
-          \`\`\`bash
-          git fetch origin
-          git checkout $TARGET
-          git merge upstream/main
-          # 解决上述文件的冲突...
-          git add .
-          git commit
-          git push origin $TARGET
-          \`\`\`
-
-          ## 上游新增提交
-          \`\`\`
-          $UPSTREAM_LOG
-          \`\`\`
-
-          解决后可关闭此 Issue，并删除临时分支：
-          \`git push origin --delete $PR_BRANCH\`
-          BODY
-          )" \
-            --label "sync,conflict" 2>/dev/null || \
-          gh issue create \
-            --title "⚠️ upstream/main 同步冲突 ($DATE) — 需手动解决" \
-            --body "见 workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          echo "📋 Opened conflict issue for $TARGET." >> $GITHUB_STEP_SUMMARY
+          CONFLICT_FILES=$(git diff --name-only --diff-filter=U HEAD~1 HEAD 2>/dev/null | head -30 || echo "(见 diff)")
+          UPSTREAM_LOG=$(git log --oneline "${{ steps.vars.outputs.target_branch }}..upstream/main" 2>/dev/null | head -20 || echo "")
+          # 写入 run summary（GitHub Actions 页面可见）
+          {
+            echo "## ⚠️ 同步冲突 — 需手动解决"
+            echo ""
+            echo "**目标分支**: \`$TARGET\`"
+            echo "**冲突分支（已推送）**: \`$PR_BRANCH\`"
+            echo ""
+            echo "### 冲突文件"
+            echo '```'
+            echo "$CONFLICT_FILES"
+            echo '```'
+            echo ""
+            echo "### 解决步骤"
+            echo '```bash'
+            echo "git fetch origin && git checkout $TARGET"
+            echo "git merge upstream/main"
+            echo "# 解决上述文件的冲突..."
+            echo "git add . && git commit && git push origin $TARGET"
+            echo "git push origin --delete $PR_BRANCH  # 清理临时分支"
+            echo '```'
+            echo ""
+            echo "### 上游新增提交"
+            echo '```'
+            echo "$UPSTREAM_LOG"
+            echo '```'
+          } >> $GITHUB_STEP_SUMMARY
+          # fork 仓库的 GITHUB_TOKEN 无法创建 Issue/PR（Resource not accessible），
+          # 这里让 run 失败，触发 GitHub 的失败邮件通知（发给仓库 owner）。
+          # 你收到邮件后点进来即可看到上面的冲突详情。
+          echo "::error::upstream/main 同步产生冲突，需手动解决。详见 run summary。"
+          exit 1
         env:
           GH_TOKEN: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
