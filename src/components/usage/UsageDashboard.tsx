@@ -5,6 +5,7 @@ import { UsageTrendChart } from "./UsageTrendChart";
 import { RequestLogTable } from "./RequestLogTable";
 import { ProviderStatsTable } from "./ProviderStatsTable";
 import { ModelStatsTable } from "./ModelStatsTable";
+import { DeviceStatsTable } from "./DeviceStatsTable";
 import {
   KNOWN_APP_TYPES,
   type AppType,
@@ -19,6 +20,7 @@ import {
   RefreshCw,
   Coins,
   LayoutGrid,
+  MonitorSmartphone,
 } from "lucide-react";
 import { ProviderIcon } from "@/components/ProviderIcon";
 import {
@@ -28,8 +30,9 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { usageKeys, useModelStats, useProviderStats } from "@/lib/query/usage";
+import { usageApi } from "@/lib/api/usage";
 import { useUsageEventBridge } from "@/hooks/useUsageEventBridge";
 import {
   Accordion,
@@ -73,7 +76,17 @@ export function UsageDashboard() {
     undefined,
   );
   const [model, setModel] = useState<string | undefined>(undefined);
+  const [deviceId, setDeviceId] = useState<string | undefined>(undefined);
   const [refreshIntervalMs, setRefreshIntervalMs] = useState(30000);
+
+  // v12+: 跨设备用量同步的远端设备列表（用于设备筛选下拉）。
+  // best-effort：远端未配置或无设备时静默失败，下拉只显示「全部」。
+  const { data: deviceOptions } = useQuery({
+    queryKey: ["usage-sync-devices"],
+    queryFn: () => usageApi.usageSyncFetchDevices(),
+    refetchInterval: 5 * 60 * 1000,
+    retry: false,
+  });
 
   // 切应用时清掉下游筛选，避免留下一个在新范围内查无数据的"幽灵"组合；
   // 切 Provider 同理清掉模型（模型选项随 Provider 级联）。
@@ -245,7 +258,7 @@ export function UsageDashboard() {
             >
               <SelectValue />
             </SelectTrigger>
-            <SelectContent className="max-w-[280px]">
+              <SelectContent className="max-w-[280px]">
               <SelectItem value="all">{t("usage.allModels")}</SelectItem>
               {modelOptions.map((name) => (
                 <SelectItem
@@ -259,6 +272,35 @@ export function UsageDashboard() {
               ))}
             </SelectContent>
           </Select>
+
+          {deviceOptions && deviceOptions.length > 0 && (
+            <Select
+              value={deviceId != null ? encodeOptionValue(deviceId) : "all"}
+              onValueChange={(v) => setDeviceId(decodeOptionValue(v))}
+            >
+              <SelectTrigger
+                className="h-9 w-[110px] bg-background text-xs focus:border-border-default [&>span]:min-w-0 [&>span]:truncate"
+                title={deviceId ?? t("usage.filterByDevice", "All Devices")}
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent className="max-w-[280px]">
+                <SelectItem value="all">
+                  {t("usage.allDevices", "All Devices")}
+                </SelectItem>
+                {deviceOptions.map((d) => (
+                  <SelectItem
+                    key={d.deviceId}
+                    value={encodeOptionValue(d.deviceId)}
+                    title={d.deviceName}
+                    className="[&>span]:min-w-0 [&>span]:truncate"
+                  >
+                    {d.deviceName}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          )}
 
           <div className="flex items-center gap-2 ml-auto lg:ml-0">
             <Select
@@ -298,6 +340,7 @@ export function UsageDashboard() {
         appType={appType === "all" ? undefined : appType}
         providerName={providerName}
         model={model}
+        deviceId={deviceId}
         refreshIntervalMs={refreshIntervalMs}
       />
 
@@ -307,6 +350,7 @@ export function UsageDashboard() {
         appType={appType}
         providerName={providerName}
         model={model}
+        deviceId={deviceId}
         refreshIntervalMs={refreshIntervalMs}
       />
 
@@ -326,6 +370,10 @@ export function UsageDashboard() {
                 <BarChart3 className="h-4 w-4" />
                 {t("usage.modelStats")}
               </TabsTrigger>
+              <TabsTrigger value="devices" className="gap-2">
+                <MonitorSmartphone className="h-4 w-4" />
+                {t("usage.deviceStats", "Devices")}
+              </TabsTrigger>
             </TabsList>
           </div>
 
@@ -341,6 +389,7 @@ export function UsageDashboard() {
                 appType={appType}
                 providerName={providerName}
                 model={model}
+                deviceId={deviceId}
                 refreshIntervalMs={refreshIntervalMs}
                 onRangeChange={setRange}
               />
@@ -352,12 +401,24 @@ export function UsageDashboard() {
                 appType={appType}
                 providerName={providerName}
                 model={model}
+                deviceId={deviceId}
                 refreshIntervalMs={refreshIntervalMs}
               />
             </TabsContent>
 
             <TabsContent value="models" className="mt-0">
               <ModelStatsTable
+                range={range}
+                appType={appType}
+                providerName={providerName}
+                model={model}
+                deviceId={deviceId}
+                refreshIntervalMs={refreshIntervalMs}
+              />
+            </TabsContent>
+
+            <TabsContent value="devices" className="mt-0">
+              <DeviceStatsTable
                 range={range}
                 appType={appType}
                 providerName={providerName}

@@ -1,8 +1,10 @@
 //! 故障转移队列 DAO
 //!
-//! 管理代理模式下的故障转移队列（基于 providers 表的 in_failover_queue 字段）
+//! v12 起，故障转移队列状态（原 providers.in_failover_queue 列）迁移至
+//! 本地 settings.json 的 device_activation.failover_queue，确保配置同步
+//! 只传 provider 定义、不传各设备的故障转移选择。
 
-use crate::database::{lock_conn, Database};
+use crate::database::Database;
 use crate::error::AppError;
 use crate::provider::Provider;
 use serde::{Deserialize, Serialize};
@@ -21,55 +23,42 @@ pub struct FailoverQueueItem {
 impl Database {
     /// 获取故障转移队列（按 sort_index 排序）
     pub fn get_failover_queue(&self, app_type: &str) -> Result<Vec<FailoverQueueItem>, AppError> {
-        let conn = lock_conn!(self.conn);
+        let queue_ids = crate::settings::get_failover_queue(app_type);
+        if queue_ids.is_empty() {
+            return Ok(Vec::new());
+        }
 
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, name, sort_index, notes
-                 FROM providers
-                 WHERE app_type = ?1 AND in_failover_queue = 1
-                 ORDER BY COALESCE(sort_index, 999999), id ASC",
-            )
-            .map_err(|e| AppError::Database(e.to_string()))?;
-
-        let items = stmt
-            .query_map([app_type], |row| {
-                Ok(FailoverQueueItem {
-                    provider_id: row.get(0)?,
-                    provider_name: row.get(1)?,
-                    sort_index: row.get(2)?,
-                    provider_notes: row.get(3)?,
-                })
+        let providers = self.get_all_providers(app_type)?;
+        // 保持 settings 中的顺序（即加入顺序）
+        let items = queue_ids
+            .iter()
+            .filter_map(|id| providers.get(id))
+            .map(|p| FailoverQueueItem {
+                provider_id: p.id.clone(),
+                provider_name: p.name.clone(),
+                sort_index: p.sort_index,
+                provider_notes: p.notes.clone(),
             })
-            .map_err(|e| AppError::Database(e.to_string()))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| AppError::Database(e.to_string()))?;
-
+            .collect();
         Ok(items)
     }
 
     /// 获取故障转移队列中的供应商（完整 Provider 信息，按顺序）
     pub fn get_failover_providers(&self, app_type: &str) -> Result<Vec<Provider>, AppError> {
         let all_providers = self.get_all_providers(app_type)?;
+        let queue_ids = crate::settings::get_failover_queue(app_type);
 
-        let result: Vec<Provider> = all_providers
-            .into_values()
-            .filter(|p| p.in_failover_queue)
+        // 按 settings 中的顺序输出
+        let result: Vec<Provider> = queue_ids
+            .iter()
+            .filter_map(|id| all_providers.get(id).cloned())
             .collect();
-
         Ok(result)
     }
 
     /// 添加供应商到故障转移队列
     pub fn add_to_failover_queue(&self, app_type: &str, provider_id: &str) -> Result<(), AppError> {
-        let conn = lock_conn!(self.conn);
-
-        conn.execute(
-            "UPDATE providers SET in_failover_queue = 1 WHERE id = ?1 AND app_type = ?2",
-            rusqlite::params![provider_id, app_type],
-        )
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
+        crate::settings::add_to_failover_queue(app_type, provider_id)?;
         Ok(())
     }
 
@@ -79,16 +68,11 @@ impl Database {
         app_type: &str,
         provider_id: &str,
     ) -> Result<(), AppError> {
-        let conn = lock_conn!(self.conn);
-
-        // 1. 从队列中移除
-        conn.execute(
-            "UPDATE providers SET in_failover_queue = 0 WHERE id = ?1 AND app_type = ?2",
-            rusqlite::params![provider_id, app_type],
-        )
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        // 1. 从 settings 移除
+        crate::settings::remove_from_failover_queue(app_type, provider_id)?;
 
         // 2. 清除该供应商的健康状态（退出队列后不再需要健康监控）
+        let conn = crate::database::lock_conn!(self.conn);
         conn.execute(
             "DELETE FROM provider_health WHERE provider_id = ?1 AND app_type = ?2",
             rusqlite::params![provider_id, app_type],
@@ -102,14 +86,7 @@ impl Database {
 
     /// 清空故障转移队列
     pub fn clear_failover_queue(&self, app_type: &str) -> Result<(), AppError> {
-        let conn = lock_conn!(self.conn);
-
-        conn.execute(
-            "UPDATE providers SET in_failover_queue = 0 WHERE app_type = ?1",
-            [app_type],
-        )
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
+        crate::settings::clear_failover_queue(app_type)?;
         Ok(())
     }
 
@@ -119,17 +96,7 @@ impl Database {
         app_type: &str,
         provider_id: &str,
     ) -> Result<bool, AppError> {
-        let conn = lock_conn!(self.conn);
-
-        let in_queue: bool = conn
-            .query_row(
-                "SELECT in_failover_queue FROM providers WHERE id = ?1 AND app_type = ?2",
-                rusqlite::params![provider_id, app_type],
-                |row| row.get(0),
-            )
-            .unwrap_or(false);
-
-        Ok(in_queue)
+        Ok(crate::settings::is_in_failover_queue(app_type, provider_id))
     }
 
     /// 获取可添加到故障转移队列的供应商（不在队列中的）
@@ -138,12 +105,10 @@ impl Database {
         app_type: &str,
     ) -> Result<Vec<Provider>, AppError> {
         let all_providers = self.get_all_providers(app_type)?;
-
         let available: Vec<Provider> = all_providers
             .into_values()
             .filter(|p| !p.in_failover_queue)
             .collect();
-
         Ok(available)
     }
 }

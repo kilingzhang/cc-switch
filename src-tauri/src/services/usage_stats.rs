@@ -40,6 +40,14 @@ pub struct UsageSummaryByApp {
     pub summary: UsageSummary,
 }
 
+/// 按设备拆分的使用量汇总（v12+ 设备维度）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageSummaryByDevice {
+    pub device_id: String,
+    pub summary: UsageSummary,
+}
+
 /// Helper: compute (real_total, hit_rate) from the four token counters.
 /// All inputs must already be cache-normalized (i.e. input excludes cache).
 fn derive_real_total_and_hit_rate(
@@ -106,6 +114,8 @@ pub struct LogFilters {
     pub status_code: Option<u16>,
     pub start_date: Option<i64>,
     pub end_date: Option<i64>,
+    /// 设备筛选（v12+）。None = 全部设备；Some(id) = 仅该设备。
+    pub device_id: Option<String>,
 }
 
 /// 分页请求日志响应
@@ -152,6 +162,9 @@ pub struct RequestLogDetail {
     /// 写入时实际用于计价的模型名。None = v11 前的历史行，"" = 未计价的错误行。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pricing_model: Option<String>,
+    /// 产生该请求的设备 ID（v12+）。None = 历史行或未设置。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
 }
 
 /// 把 25 列的查询结果映射为 `RequestLogDetail`。
@@ -194,6 +207,7 @@ fn row_to_request_log_detail(row: &rusqlite::Row<'_>) -> rusqlite::Result<Reques
         created_at: row.get(22)?,
         data_source: row.get(23)?,
         pricing_model: row.get(24)?,
+        device_id: row.get(25)?,
     })
 }
 
@@ -285,6 +299,23 @@ fn push_provider_model_filters(
     if let Some(m) = model {
         conditions.push(format!("{} = ?", effective_model_sql(log_alias)));
         params.push(Box::new(m.to_string()));
+    }
+}
+
+/// 把 device_id 过滤条件追加到 conditions / params。
+///
+/// 明细表（proxy_request_logs）的 device_id 可能为 NULL（历史行或未设置），
+/// 这里用 `COALESCE({alias}.device_id, '') = ?` 归一处理，保证筛选稳定。
+/// 传 None 时不加任何条件（= 全部设备）。
+fn push_device_filter(
+    conditions: &mut Vec<String>,
+    params: &mut Vec<Box<dyn rusqlite::ToSql>>,
+    alias: &str,
+    device_id: Option<&str>,
+) {
+    if let Some(d) = device_id {
+        conditions.push(format!("COALESCE({alias}.device_id, '') = ?"));
+        params.push(Box::new(d.to_string()));
     }
 }
 
@@ -509,6 +540,7 @@ impl Database {
         app_type: Option<&str>,
         provider_name: Option<&str>,
         model: Option<&str>,
+        device_id: Option<&str>,
     ) -> Result<UsageSummary, AppError> {
         let conn = lock_conn!(self.conn);
 
@@ -536,6 +568,7 @@ impl Database {
             provider_name,
             model,
         );
+        push_device_filter(&mut conditions, &mut params_vec, "l", device_id);
 
         let where_clause = if conditions.is_empty() {
             String::new()
@@ -571,6 +604,7 @@ impl Database {
             provider_name,
             model,
         );
+        push_device_filter(&mut rollup_conditions, &mut rollup_params, "r", device_id);
 
         let rollup_where = if rollup_conditions.is_empty() {
             String::new()
@@ -669,6 +703,7 @@ impl Database {
         end_date: Option<i64>,
         provider_name: Option<&str>,
         model: Option<&str>,
+        device_id: Option<&str>,
     ) -> Result<Vec<UsageSummaryByApp>, AppError> {
         let conn = lock_conn!(self.conn);
 
@@ -690,6 +725,7 @@ impl Database {
             provider_name,
             model,
         );
+        push_device_filter(&mut detail_conditions, &mut detail_params, "l", device_id);
         let detail_where = format!("WHERE {}", detail_conditions.join(" AND "));
         let detail_join = if provider_name.is_some() {
             providers_join("l", "p")
@@ -714,6 +750,7 @@ impl Database {
             provider_name,
             model,
         );
+        push_device_filter(&mut rollup_conditions, &mut rollup_params, "r", device_id);
         let rollup_where = if rollup_conditions.is_empty() {
             String::new()
         } else {
@@ -825,6 +862,177 @@ impl Database {
         Ok(summaries)
     }
 
+    /// 按设备维度获取使用量汇总（v12+）。
+    ///
+    /// 与 `get_usage_summary_by_app` 结构一致，只是 GROUP BY 维度从 app_type 换成 device_id。
+    /// 用于前端「按设备分组」展示。明细行 device_id 可能为 NULL，归一为 ''。
+    pub fn get_usage_summary_by_device(
+        &self,
+        start_date: Option<i64>,
+        end_date: Option<i64>,
+        app_type: Option<&str>,
+        provider_name: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<Vec<UsageSummaryByDevice>, AppError> {
+        let conn = lock_conn!(self.conn);
+
+        let mut detail_conditions = vec![effective_usage_log_filter("l")];
+        let mut detail_params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(start) = start_date {
+            detail_conditions.push("l.created_at >= ?".to_string());
+            detail_params.push(Box::new(start));
+        }
+        if let Some(end) = end_date {
+            detail_conditions.push("l.created_at <= ?".to_string());
+            detail_params.push(Box::new(end));
+        }
+        if let Some(at) = app_type {
+            detail_conditions.push(format!("{} = ?", folded_app_type_sql("l.app_type")));
+            detail_params.push(Box::new(at.to_string()));
+        }
+        push_provider_model_filters(
+            &mut detail_conditions,
+            &mut detail_params,
+            "l",
+            "p",
+            provider_name,
+            model,
+        );
+        let detail_where = format!("WHERE {}", detail_conditions.join(" AND "));
+        let detail_join = if provider_name.is_some() {
+            providers_join("l", "p")
+        } else {
+            String::new()
+        };
+
+        let rollup_bounds = compute_rollup_date_bounds(start_date, end_date)?;
+        let mut rollup_conditions: Vec<String> = Vec::new();
+        let mut rollup_params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        push_rollup_date_filters(
+            &mut rollup_conditions,
+            &mut rollup_params,
+            "r.date",
+            &rollup_bounds,
+        );
+        if let Some(at) = app_type {
+            rollup_conditions.push(format!("{} = ?", folded_app_type_sql("r.app_type")));
+            rollup_params.push(Box::new(at.to_string()));
+        }
+        push_provider_model_filters(
+            &mut rollup_conditions,
+            &mut rollup_params,
+            "r",
+            "p2",
+            provider_name,
+            model,
+        );
+        let rollup_where = if rollup_conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", rollup_conditions.join(" AND "))
+        };
+        let rollup_join = if provider_name.is_some() {
+            providers_join("r", "p2")
+        } else {
+            String::new()
+        };
+
+        let fresh_input_detail = fresh_input_sql("l");
+        let fresh_input_rollup = fresh_input_sql("r");
+        let sql = format!(
+            "SELECT device_id,
+                SUM(req_count) as req_count,
+                SUM(cost) as cost,
+                SUM(input_t) as input_t,
+                SUM(output_t) as output_t,
+                SUM(cache_create_t) as cache_create_t,
+                SUM(cache_read_t) as cache_read_t,
+                SUM(success_count) as success_count
+            FROM (
+                SELECT COALESCE(l.device_id, '') as device_id,
+                    COUNT(*) as req_count,
+                    COALESCE(SUM(CAST(l.total_cost_usd AS REAL)), 0) as cost,
+                    COALESCE(SUM({fresh_input_detail}), 0) as input_t,
+                    COALESCE(SUM(l.output_tokens), 0) as output_t,
+                    COALESCE(SUM(l.cache_creation_tokens), 0) as cache_create_t,
+                    COALESCE(SUM(l.cache_read_tokens), 0) as cache_read_t,
+                    COALESCE(SUM(CASE WHEN l.status_code >= 200 AND l.status_code < 300 THEN 1 ELSE 0 END), 0) as success_count
+                FROM proxy_request_logs l {detail_join} {detail_where}
+                GROUP BY device_id
+                UNION ALL
+                SELECT COALESCE(r.device_id, '') as device_id,
+                    COALESCE(SUM(r.request_count), 0),
+                    COALESCE(SUM(CAST(r.total_cost_usd AS REAL)), 0),
+                    COALESCE(SUM({fresh_input_rollup}), 0),
+                    COALESCE(SUM(r.output_tokens), 0),
+                    COALESCE(SUM(r.cache_creation_tokens), 0),
+                    COALESCE(SUM(r.cache_read_tokens), 0),
+                    COALESCE(SUM(r.success_count), 0)
+                FROM usage_daily_rollups r {rollup_join} {rollup_where}
+                GROUP BY device_id
+            )
+            GROUP BY device_id"
+        );
+
+        let mut combined: Vec<Box<dyn rusqlite::ToSql>> = detail_params;
+        combined.extend(rollup_params);
+        let refs: Vec<&dyn rusqlite::ToSql> = combined.iter().map(|p| p.as_ref()).collect();
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(refs.as_slice(), |row| {
+            let device_id: String = row.get(0)?;
+            let total_requests: i64 = row.get(1)?;
+            let total_cost: f64 = row.get(2)?;
+            let total_input_tokens: i64 = row.get(3)?;
+            let total_output_tokens: i64 = row.get(4)?;
+            let total_cache_creation_tokens: i64 = row.get(5)?;
+            let total_cache_read_tokens: i64 = row.get(6)?;
+            let success_count: i64 = row.get(7)?;
+
+            let success_rate = if total_requests > 0 {
+                (success_count as f32 / total_requests as f32) * 100.0
+            } else {
+                0.0
+            };
+            let (real_total_tokens, cache_hit_rate) = derive_real_total_and_hit_rate(
+                total_input_tokens as u64,
+                total_output_tokens as u64,
+                total_cache_creation_tokens as u64,
+                total_cache_read_tokens as u64,
+            );
+
+            Ok(UsageSummaryByDevice {
+                device_id,
+                summary: UsageSummary {
+                    total_requests: total_requests as u64,
+                    total_cost: format!("{total_cost:.6}"),
+                    total_input_tokens: total_input_tokens as u64,
+                    total_output_tokens: total_output_tokens as u64,
+                    total_cache_creation_tokens: total_cache_creation_tokens as u64,
+                    total_cache_read_tokens: total_cache_read_tokens as u64,
+                    success_rate,
+                    real_total_tokens,
+                    cache_hit_rate,
+                },
+            })
+        })?;
+
+        let mut summaries = Vec::new();
+        for row in rows {
+            let item = row?;
+            if item.summary.total_requests == 0 && item.summary.real_total_tokens == 0 {
+                continue;
+            }
+            summaries.push(item);
+        }
+        summaries.sort_by(|a, b| {
+            b.summary
+                .real_total_tokens
+                .cmp(&a.summary.real_total_tokens)
+        });
+        Ok(summaries)
+    }
+
     /// 获取每日趋势（滑动窗口，<=24h 按小时，>24h 按天，窗口与汇总一致）
     pub fn get_daily_trends(
         &self,
@@ -833,6 +1041,7 @@ impl Database {
         app_type: Option<&str>,
         provider_name: Option<&str>,
         model: Option<&str>,
+        device_id: Option<&str>,
     ) -> Result<Vec<DailyStats>, AppError> {
         let conn = lock_conn!(self.conn);
 
@@ -870,6 +1079,7 @@ impl Database {
                 provider_name,
                 model,
             );
+            push_device_filter(&mut extra_conditions, &mut extra_params, "l", device_id);
             let extra_filter = extra_conditions
                 .iter()
                 .map(|c| format!("AND {c}"))
@@ -983,6 +1193,7 @@ impl Database {
             provider_name,
             model,
         );
+        push_device_filter(&mut extra_conditions, &mut extra_params, "l", device_id);
         let extra_filter = extra_conditions
             .iter()
             .map(|c| format!("AND {c}"))
@@ -1066,6 +1277,7 @@ impl Database {
             provider_name,
             model,
         );
+        push_device_filter(&mut rollup_conditions, &mut rollup_params, "r", device_id);
 
         let rollup_where = if rollup_conditions.is_empty() {
             String::new()
@@ -1173,6 +1385,7 @@ impl Database {
         app_type: Option<&str>,
         provider_name: Option<&str>,
         model: Option<&str>,
+        device_id: Option<&str>,
     ) -> Result<Vec<ProviderStats>, AppError> {
         let conn = lock_conn!(self.conn);
 
@@ -1198,6 +1411,7 @@ impl Database {
             provider_name,
             model,
         );
+        push_device_filter(&mut detail_conditions, &mut detail_params, "l", device_id);
         let detail_where = if detail_conditions.is_empty() {
             String::new()
         } else {
@@ -1225,6 +1439,7 @@ impl Database {
             provider_name,
             model,
         );
+        push_device_filter(&mut rollup_conditions, &mut rollup_params, "r", device_id);
         let rollup_where = if rollup_conditions.is_empty() {
             String::new()
         } else {
@@ -1317,6 +1532,7 @@ impl Database {
         app_type: Option<&str>,
         provider_name: Option<&str>,
         model: Option<&str>,
+        device_id: Option<&str>,
     ) -> Result<Vec<ModelStats>, AppError> {
         let conn = lock_conn!(self.conn);
 
@@ -1342,6 +1558,7 @@ impl Database {
             provider_name,
             model,
         );
+        push_device_filter(&mut detail_conditions, &mut detail_params, "l", device_id);
         let detail_where = if detail_conditions.is_empty() {
             String::new()
         } else {
@@ -1374,6 +1591,7 @@ impl Database {
             provider_name,
             model,
         );
+        push_device_filter(&mut rollup_conditions, &mut rollup_params, "r", device_id);
         let rollup_where = if rollup_conditions.is_empty() {
             String::new()
         } else {
@@ -1484,6 +1702,7 @@ impl Database {
             filters.provider_name.as_deref(),
             filters.model.as_deref(),
         );
+        push_device_filter(&mut conditions, &mut params, "l", filters.device_id.as_deref());
         if let Some(status) = filters.status_code {
             conditions.push("l.status_code = ?".to_string());
             params.push(Box::new(status as i64));
@@ -1526,7 +1745,7 @@ impl Database {
                     l.input_tokens, l.output_tokens, l.cache_read_tokens, l.cache_creation_tokens,
                     l.input_cost_usd, l.output_cost_usd, l.cache_read_cost_usd, l.cache_creation_cost_usd, l.total_cost_usd,
                     l.is_streaming, l.latency_ms, l.first_token_ms, l.duration_ms,
-                    l.status_code, l.error_message, l.created_at, l.data_source, l.pricing_model
+                    l.status_code, l.error_message, l.created_at, l.data_source, l.pricing_model, l.device_id
              FROM proxy_request_logs l
              LEFT JOIN providers p ON l.provider_id = p.id AND l.app_type = p.app_type
              {where_clause}
@@ -1569,7 +1788,7 @@ impl Database {
                     input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
                     input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd, total_cost_usd,
                     is_streaming, latency_ms, first_token_ms, duration_ms,
-                    status_code, error_message, created_at, l.data_source, l.pricing_model
+                    status_code, error_message, created_at, l.data_source, l.pricing_model, l.device_id
              FROM proxy_request_logs l
              LEFT JOIN providers p ON l.provider_id = p.id AND l.app_type = p.app_type
              WHERE l.request_id = ?"
@@ -1725,7 +1944,7 @@ impl Database {
                         input_cost_usd, output_cost_usd, cache_read_cost_usd,
                         cache_creation_cost_usd, total_cost_usd, is_streaming, latency_ms,
                         first_token_ms, duration_ms, status_code, error_message, created_at,
-                        data_source, pricing_model
+                        data_source, pricing_model, device_id
              FROM proxy_request_logs
              WHERE CAST(total_cost_usd AS REAL) <= 0
                AND (input_tokens > 0 OR output_tokens > 0
@@ -2418,7 +2637,7 @@ mod tests {
         }
 
         // ① 分应用汇总：desktop 折叠进 claude，不再单列 claude-desktop 桶。
-        let by_app = db.get_usage_summary_by_app(None, None, None, None)?;
+        let by_app = db.get_usage_summary_by_app(None, None, None, None, None)?;
         assert_eq!(by_app.len(), 1, "应只剩一个合并后的 claude 桶");
         assert_eq!(by_app[0].app_type, "claude");
         assert_eq!(by_app[0].summary.total_requests, 2, "两条行都计入 claude");
@@ -2428,7 +2647,7 @@ mod tests {
         );
 
         // ② 选中 claude 过滤：汇总应同时覆盖 desktop 行。
-        let claude_summary = db.get_usage_summary(None, None, Some("claude"), None, None)?;
+        let claude_summary = db.get_usage_summary(None, None, Some("claude"), None, None, None)?;
         assert_eq!(claude_summary.total_requests, 2);
 
         // ③ 请求日志按 claude 过滤返回两行，且 desktop 行投影仍是原始 app_type。
@@ -2447,7 +2666,7 @@ mod tests {
         );
 
         // ④ 折叠不外溢：codex 过滤为空。
-        let codex_summary = db.get_usage_summary(None, None, Some("codex"), None, None)?;
+        let codex_summary = db.get_usage_summary(None, None, Some("codex"), None, None, None)?;
         assert_eq!(codex_summary.total_requests, 0);
 
         Ok(())
@@ -2808,7 +3027,7 @@ mod tests {
             )?;
         }
 
-        let summary = db.get_usage_summary(None, None, None, None, None)?;
+        let summary = db.get_usage_summary(None, None, None, None, None, None)?;
         assert_eq!(summary.total_requests, 2);
         assert_eq!(summary.success_rate, 100.0);
 
@@ -2888,7 +3107,7 @@ mod tests {
             )?;
         }
 
-        let summary = db.get_usage_summary(Some(start), Some(end), Some("claude"), None, None)?;
+        let summary = db.get_usage_summary(Some(start), Some(end), Some("claude"), None, None, None)?;
         assert_eq!(summary.total_requests, 20);
         assert_eq!(summary.total_input_tokens, 2000);
         assert_eq!(summary.total_output_tokens, 1000);
@@ -2991,38 +3210,38 @@ mod tests {
         }
 
         // ① 汇总按 Provider 展示名过滤：明细 + rollup 都命中。
-        let packy = db.get_usage_summary(None, None, None, Some("Packy"), None)?;
+        let packy = db.get_usage_summary(None, None, None, Some("Packy"), None, None)?;
         assert_eq!(packy.total_requests, 7, "a-1 + a-2 + rollup 5");
 
         // ② 汇总按模型过滤（有效计价模型口径）。
-        let deepseek = db.get_usage_summary(None, None, None, None, Some("deepseek-v3"))?;
+        let deepseek = db.get_usage_summary(None, None, None, None, Some("deepseek-v3"), None)?;
         assert_eq!(deepseek.total_requests, 8, "b-1 + rollup 7");
 
         // ③ pricing_model 优先于 model：alias-model 查不到，real-model 查得到。
-        let by_alias = db.get_usage_summary(None, None, None, None, Some("alias-model"))?;
+        let by_alias = db.get_usage_summary(None, None, None, None, Some("alias-model"), None)?;
         assert_eq!(by_alias.total_requests, 0);
-        let by_real = db.get_usage_summary(None, None, None, None, Some("real-model"))?;
+        let by_real = db.get_usage_summary(None, None, None, None, Some("real-model"), None)?;
         assert_eq!(by_real.total_requests, 1);
 
         // ④ 会话占位行可按可读名选中。
-        let session = db.get_usage_summary(None, None, None, Some("Claude (Session)"), None)?;
+        let session = db.get_usage_summary(None, None, None, Some("Claude (Session)"), None, None)?;
         assert_eq!(session.total_requests, 1);
 
         // ⑤ Provider 统计 + 模型过滤：只剩 DeepSeek 一行。
-        let provider_stats = db.get_provider_stats(None, None, None, None, Some("deepseek-v3"))?;
+        let provider_stats = db.get_provider_stats(None, None, None, None, Some("deepseek-v3"), None)?;
         assert_eq!(provider_stats.len(), 1);
         assert_eq!(provider_stats[0].provider_name, "DeepSeek");
         assert_eq!(provider_stats[0].request_count, 8);
 
         // ⑥ 模型统计 + Provider 过滤：只剩 Packy 名下的模型。
-        let model_stats = db.get_model_stats(None, None, None, Some("Packy"), None)?;
+        let model_stats = db.get_model_stats(None, None, None, Some("Packy"), None, None)?;
         let models: Vec<&str> = model_stats.iter().map(|m| m.model.as_str()).collect();
         assert!(models.contains(&"claude-sonnet-4-6"));
         assert!(models.contains(&"real-model"));
         assert!(!models.contains(&"deepseek-v3"));
 
         // ⑦ 分应用汇总（Hero 卡片数据源）同样受过滤影响。
-        let by_app = db.get_usage_summary_by_app(None, None, Some("Packy"), None)?;
+        let by_app = db.get_usage_summary_by_app(None, None, Some("Packy"), None, None)?;
         assert_eq!(by_app.len(), 1);
         assert_eq!(by_app[0].app_type, "claude");
         assert_eq!(by_app[0].summary.total_requests, 7);
@@ -3030,7 +3249,7 @@ mod tests {
         // ⑧ 趋势（>24h 走天分桶 + rollup 分支）。
         let t_start = local_ts(2026, 6, 8, 0, 0, 0);
         let t_end = local_ts(2026, 6, 10, 23, 59, 0);
-        let trends = db.get_daily_trends(Some(t_start), Some(t_end), None, Some("Packy"), None)?;
+        let trends = db.get_daily_trends(Some(t_start), Some(t_end), None, Some("Packy"), None, None)?;
         let total_req: u64 = trends.iter().map(|d| d.request_count).sum();
         assert_eq!(total_req, 7, "明细 2 + rollup 5");
 
@@ -3044,6 +3263,7 @@ mod tests {
             None,
             Some("Packy"),
             Some("claude-sonnet-4-6"),
+            None,
         )?;
         let hourly_req: u64 = hourly.iter().map(|d| d.request_count).sum();
         assert_eq!(hourly_req, 1, "仅 a-1 命中（a-2 计价模型不同）");
@@ -3117,7 +3337,7 @@ mod tests {
             )?;
         }
 
-        let summary = db.get_usage_summary(Some(start), Some(end), Some("claude"), None, None)?;
+        let summary = db.get_usage_summary(Some(start), Some(end), Some("claude"), None, None, None)?;
         assert_eq!(summary.total_requests, 30);
         assert_eq!(summary.total_input_tokens, 3000);
         assert_eq!(summary.total_output_tokens, 1500);
@@ -3238,7 +3458,7 @@ mod tests {
             )?;
         }
 
-        let summary = db.get_usage_summary(None, None, None, None, None)?;
+        let summary = db.get_usage_summary(None, None, None, None, None, None)?;
         assert_eq!(summary.total_requests, 4);
         // codex-proxy contributes 100-10=90; gemini-proxy contributes 200-30=170
         // (both cache-inclusive providers). claude-proxy=300, codex-session-only=50.
@@ -3253,10 +3473,10 @@ mod tests {
         let expected_hit_rate = 60.0_f64 / 682.0_f64;
         assert!((summary.cache_hit_rate - expected_hit_rate).abs() < 1e-9);
 
-        let trends = db.get_daily_trends(Some(0), Some(40_000), None, None, None)?;
+        let trends = db.get_daily_trends(Some(0), Some(40_000), None, None, None, None)?;
         assert_eq!(trends.iter().map(|stat| stat.request_count).sum::<u64>(), 4);
 
-        let provider_stats = db.get_provider_stats(None, None, None, None, None)?;
+        let provider_stats = db.get_provider_stats(None, None, None, None, None, None)?;
         assert_eq!(
             provider_stats
                 .iter()
@@ -3274,7 +3494,7 @@ mod tests {
             .iter()
             .any(|stat| stat.provider_id == "_session"));
 
-        let model_stats = db.get_model_stats(None, None, None, None, None)?;
+        let model_stats = db.get_model_stats(None, None, None, None, None, None)?;
         assert_eq!(
             model_stats
                 .iter()
@@ -3466,7 +3686,7 @@ mod tests {
             )?;
         }
 
-        let summary = db.get_usage_summary(None, None, None, None, None)?;
+        let summary = db.get_usage_summary(None, None, None, None, None, None)?;
         assert_eq!(summary.total_requests, 9);
 
         let logs = db.get_request_logs(&LogFilters::default(), 0, 10)?;
@@ -3514,7 +3734,7 @@ mod tests {
             )?;
         }
 
-        let stats = db.get_model_stats(None, None, None, None, None)?;
+        let stats = db.get_model_stats(None, None, None, None, None, None)?;
         assert_eq!(stats.len(), 1);
         assert_eq!(stats[0].model, "claude-3-sonnet");
         assert_eq!(stats[0].request_count, 1);
@@ -3546,7 +3766,7 @@ mod tests {
             )?;
         }
 
-        let stats = db.get_provider_stats(Some(1500), Some(2500), Some("claude"), None, None)?;
+        let stats = db.get_provider_stats(Some(1500), Some(2500), Some("claude"), None, None, None)?;
         assert_eq!(stats.len(), 1);
         assert_eq!(stats[0].provider_id, "p1");
         assert_eq!(stats[0].request_count, 1);
@@ -3578,7 +3798,7 @@ mod tests {
             )?;
         }
 
-        let stats = db.get_provider_stats(None, None, Some("opencode"), None, None)?;
+        let stats = db.get_provider_stats(None, None, Some("opencode"), None, None, None)?;
         assert_eq!(stats.len(), 1);
         assert_eq!(stats[0].provider_id, "_opencode_session");
         assert_eq!(stats[0].provider_name, "OpenCode (Session)");
@@ -3659,7 +3879,7 @@ mod tests {
             )?;
         }
 
-        let stats = db.get_provider_stats(Some(start), Some(end), Some("claude"), None, None)?;
+        let stats = db.get_provider_stats(Some(start), Some(end), Some("claude"), None, None, None)?;
         assert_eq!(stats.len(), 1);
         assert_eq!(stats[0].provider_id, "p-rollup");
         assert_eq!(stats[0].request_count, 8);
@@ -3695,7 +3915,7 @@ mod tests {
             )?;
         }
 
-        let stats = db.get_daily_trends(Some(0), Some(15 * 60 * 60), Some("claude"), None, None)?;
+        let stats = db.get_daily_trends(Some(0), Some(15 * 60 * 60), Some("claude"), None, None, None)?;
         assert_eq!(stats.len(), 15);
         assert_eq!(stats[3].request_count, 1);
 
@@ -3772,7 +3992,7 @@ mod tests {
             )?;
         }
 
-        let stats = db.get_daily_trends(Some(start), Some(end), Some("claude"), None, None)?;
+        let stats = db.get_daily_trends(Some(start), Some(end), Some("claude"), None, None, None)?;
         assert_eq!(stats.len(), 3);
         assert_eq!(stats[0].request_count, 1);
         assert_eq!(stats[0].total_tokens, 150);
@@ -3857,7 +4077,7 @@ mod tests {
             )?;
         }
 
-        let stats = db.get_model_stats(Some(start), Some(end), Some("claude"), None, None)?;
+        let stats = db.get_model_stats(Some(start), Some(end), Some("claude"), None, None, None)?;
         assert_eq!(stats.len(), 1);
         assert_eq!(stats[0].model, "claude-3-haiku");
         assert_eq!(stats[0].request_count, 9);

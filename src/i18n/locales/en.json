@@ -372,6 +372,10 @@
         "title": "Cloud Sync",
         "description": "Sync data across devices via WebDAV"
       },
+      "usageSync": {
+        "title": "Cross-device Usage Sync",
+        "description": "Per-device usage sync and aggregation"
+      },
       "rectifier": {
         "title": "Rectifier",
         "description": "Automatically fix API request compatibility issues",
@@ -731,7 +735,8 @@
           "ghostty": "Ghostty",
           "wezterm": "WezTerm",
           "kaku": "Kaku",
-          "warp": "Warp"
+          "warp": "Warp",
+          "otty": "Otty"
         },
         "windows": {
           "cmd": "Command Prompt",
@@ -1411,6 +1416,8 @@
     "requestLogs": "Request Logs",
     "providerStats": "Provider Stats",
     "modelStats": "Model Stats",
+    "deviceStats": "Devices",
+    "device": "Device",
     "time": "Time",
     "provider": "Provider",
     "billingModel": "Billing Model",
@@ -1491,8 +1498,13 @@
     "statusCode": "Status Code",
     "allSources": "All Sources",
     "allModels": "All Models",
+    "allDevices": "All Devices",
     "filterBySource": "Filter by source",
     "filterByModel": "Filter by model",
+    "filterByDevice": "All Devices",
+    "deviceStats": "Devices",
+    "thisDevice": "This Device",
+    "deviceStatsHint": "Per-device usage requires enabling usage sync (shares S3 sync credentials). Each device only uploads its own data.",
     "refreshInterval": "Auto-refresh interval",
     "refreshOff": "Off",
     "timeRange": "Time Range",

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -16,6 +17,65 @@ pub struct CustomEndpoint {
     pub added_at: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_used: Option<i64>,
+}
+
+/// 各应用的启用标志（设备级，不同步）
+///
+/// `claude-desktop` 和 `openclaw` 不支持 per-app 启用（MCP/Skills），
+/// 因此这里只保留 5 个应用，与 `McpApps`/`SkillApps` 对齐。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppFlags {
+    #[serde(default)]
+    pub claude: bool,
+    #[serde(default)]
+    pub codex: bool,
+    #[serde(default)]
+    pub gemini: bool,
+    #[serde(default)]
+    pub opencode: bool,
+    #[serde(default)]
+    pub hermes: bool,
+}
+
+impl AppFlags {
+    pub fn all_false() -> Self {
+        Self {
+            claude: false,
+            codex: false,
+            gemini: false,
+            opencode: false,
+            hermes: false,
+        }
+    }
+}
+
+/// 设备级激活状态（本地存储，不随数据库同步）
+///
+/// v12 起，以下信息从 DB 列迁移到本地 settings：
+/// - `providers.is_current` → 复用已有的 `current_provider_*` 字段（保留不动）
+/// - `providers.in_failover_queue` → `failover_queue`
+/// - `mcp_servers.enabled_*` → `mcp_apps`
+/// - `skills.enabled_*` → `skill_apps`
+///
+/// 这样配置同步（db.sql）只携带 provider/mcp/skill 的「定义」，
+/// 各设备的启用状态互不影响。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceActivation {
+    /// app_type → failover 队列中的 provider_id 列表（保持插入顺序）
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub failover_queue: HashMap<String, Vec<String>>,
+    /// mcp_id → per-app 启用标志
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub mcp_apps: HashMap<String, AppFlags>,
+    /// skill_id → per-app 启用标志
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub skill_apps: HashMap<String, AppFlags>,
+    /// OMO 模式「分类内当前」provider：key = `{app_type}:{category}`，value = provider_id。
+    /// OMO（如 OpenCode 的 omo / omo-slim）每个 category 有独立 current 槽位，互斥。
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub omo_current: HashMap<String, String>,
 }
 
 fn default_true() -> bool {
@@ -469,7 +529,7 @@ pub struct AppSettings {
 
     // ===== 终端设置 =====
     /// 首选终端应用（可选，默认使用系统默认终端）
-    /// - macOS: "terminal" | "iterm2" | "warp" | "alacritty" | "kitty" | "ghostty" | "wezterm" | "kaku"
+    /// - macOS: "terminal" | "iterm2" | "warp" | "alacritty" | "kitty" | "ghostty" | "wezterm" | "kaku" | "otty"
     /// - Windows: "cmd" | "powershell" | "wt" (Windows Terminal)
     /// - Linux: "gnome-terminal" | "konsole" | "xfce4-terminal" | "alacritty" | "kitty" | "ghostty"
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -478,6 +538,18 @@ pub struct AppSettings {
     // ===== 本机自动迁移状态 =====
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_migrations: Option<LocalMigrations>,
+
+    // ===== 设备身份（v12+）=====
+    /// 本机唯一标识，首次启动时自动生成（UUID v4），持久化在本地 settings.json。
+    /// 用于用量统计的设备维度归属与跨设备用量同步的远端 slot 隔离。不随数据库同步。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+
+    // ===== 设备级激活状态（v12+）=====
+    /// provider/mcp/skill 的「启用」标志从 DB 列迁移到本地，确保配置同步只传定义不传激活。
+    /// `current_provider_*` 字段（见上）已先行实现 provider 当前选择的设备级存储，这里覆盖其余激活标志。
+    #[serde(default)]
+    pub device_activation: DeviceActivation,
 }
 
 fn default_show_in_tray() -> bool {
@@ -533,6 +605,8 @@ impl Default for AppSettings {
             backup_retain_count: None,
             preferred_terminal: None,
             local_migrations: None,
+            device_id: None,
+            device_activation: DeviceActivation::default(),
         }
     }
 }
@@ -623,11 +697,19 @@ impl AppSettings {
                     settings
                 }
                 Err(err) => {
-                    log::warn!(
-                        "解析设置文件失败，将使用默认设置。路径: {}, 错误: {}",
+                    // 致命：解析失败时绝不能把 default 写回磁盘（会永久覆盖用户配置）。
+                    // 这里返回 default 仅用于本次内存会话，但必须阻止后续 save_settings_file 覆盖原文件。
+                    // 通过把原始内容备份，并标记本次会话为「只读」（任何 save 前必须先成功解析一次）。
+                    log::error!(
+                        "解析设置文件失败，将使用内存默认设置（不会覆盖磁盘文件）。\
+                         路径: {}, 错误: {}。原始内容已备份到 {}.broken",
                         path.display(),
-                        err
+                        err,
+                        path.display()
                     );
+                    // 备份损坏的文件，便于用户恢复
+                    let broken_path = format!("{}.broken", path.display());
+                    let _ = fs::write(&broken_path, &content);
                     Self::default()
                 }
             }
@@ -991,6 +1073,265 @@ pub fn get_effective_current_provider(
     db.get_current_provider(app_type.as_str())
 }
 
+// ===== 设备身份（device_id）管理函数 =====
+
+/// 本机 device_id 的进程内缓存。
+///
+/// 首次访问时从 settings.json 读取（缺失则生成 UUID v4 并持久化），
+/// 之后所有调用共享同一个 `&'static str`。proxy 热路径直接读这里，零锁、零 clone。
+static DEVICE_ID_CACHE: OnceLock<String> = OnceLock::new();
+
+/// 获取（必要时生成并持久化）本机 device_id。
+///
+/// 读取顺序：进程缓存 → settings.json → 生成新 UUID。
+/// 生成后立即写入 settings.json，确保跨重启稳定。
+pub fn get_or_create_device_id() -> String {
+    // 1. 进程缓存命中
+    if let Some(cached) = DEVICE_ID_CACHE.get() {
+        return cached.clone();
+    }
+
+    // 2. 读 settings.json
+    let existing = settings_store()
+        .read()
+        .ok()
+        .and_then(|s| s.device_id.clone());
+
+    let id = existing.unwrap_or_else(|| {
+        let new_id = uuid::Uuid::new_v4().to_string();
+        log::info!("首次生成 device_id: {new_id}");
+        // 持久化（best-effort，失败不阻塞启动）
+        if let Err(e) = mutate_settings(|s| s.device_id = Some(new_id.clone())) {
+            log::warn!("持久化 device_id 失败，将在内存中保留: {e}");
+        }
+        new_id
+    });
+
+    // 3. 写入进程缓存（get_or_init 保证并发安全；若已被其他线程抢先初始化则复用）
+    let cached = DEVICE_ID_CACHE.get_or_init(|| id.clone());
+    cached.clone()
+}
+
+/// 获取本机 device_id 的静态引用（零开销）。
+///
+/// 适用于 proxy logger、session_usage 等热路径。首次调用会触发生成与持久化。
+#[allow(dead_code)]
+pub fn device_id() -> &'static str {
+    DEVICE_ID_CACHE.get_or_init(|| get_or_create_device_id_internal())
+}
+
+/// device_id() 的内部实现，避免与 get_or_create_device_id() 的进程缓存初始化递归。
+#[allow(dead_code)]
+fn get_or_create_device_id_internal() -> String {
+    let existing = settings_store()
+        .read()
+        .ok()
+        .and_then(|s| s.device_id.clone());
+    let id = existing.unwrap_or_else(|| {
+        let new_id = uuid::Uuid::new_v4().to_string();
+        log::info!("首次生成 device_id: {new_id}");
+        if let Err(e) = mutate_settings(|s| s.device_id = Some(new_id.clone())) {
+            log::warn!("持久化 device_id 失败，将在内存中保留: {e}");
+        }
+        new_id
+    });
+    id
+}
+
+/// 直接设置 device_id（仅供迁移路径使用，避免在已有 DB 升级时重新生成）。
+#[allow(dead_code)]
+pub fn set_device_id(id: String) -> Result<(), AppError> {
+    mutate_settings(|s| s.device_id = Some(id))?;
+    Ok(())
+}
+
+/// 收集所有已设置的 current_provider_*（返回 HashMap，供迁移回填时判断本地是否已有值）。
+pub fn collect_current_providers() -> HashMap<AppType, Option<String>> {
+    let s = settings_store().read().ok();
+    let mut map = HashMap::new();
+    map.insert(AppType::Claude, s.as_ref().and_then(|s| s.current_provider_claude.clone()));
+    map.insert(
+        AppType::ClaudeDesktop,
+        s.as_ref()
+            .and_then(|s| s.current_provider_claude_desktop.clone()),
+    );
+    map.insert(AppType::Codex, s.as_ref().and_then(|s| s.current_provider_codex.clone()));
+    map.insert(AppType::Gemini, s.as_ref().and_then(|s| s.current_provider_gemini.clone()));
+    map.insert(
+        AppType::OpenCode,
+        s.as_ref().and_then(|s| s.current_provider_opencode.clone()),
+    );
+    map.insert(
+        AppType::OpenClaw,
+        s.as_ref().and_then(|s| s.current_provider_openclaw.clone()),
+    );
+    map.insert(AppType::Hermes, s.as_ref().and_then(|s| s.current_provider_hermes.clone()));
+    map
+}
+
+/// 整体替换 device_activation（迁移回填时一次性写回）。
+pub fn set_device_activation(activation: DeviceActivation) -> Result<(), AppError> {
+    mutate_settings(|s| {
+        s.device_activation = activation;
+    })
+}
+
+// ===== 设备级激活状态（failover / mcp apps / skill apps）管理函数 =====
+
+/// 获取指定 app 的 failover 队列（provider_id 列表，保持顺序）。
+pub fn get_failover_queue(app_type: &str) -> Vec<String> {
+    settings_store()
+        .read()
+        .ok()
+        .and_then(|s| s.device_activation.failover_queue.get(app_type).cloned())
+        .unwrap_or_default()
+}
+
+/// 整体替换指定 app 的 failover 队列。
+#[allow(dead_code)]
+pub fn set_failover_queue(app_type: &str, provider_ids: Vec<String>) -> Result<(), AppError> {
+    mutate_settings(|s| {
+        if provider_ids.is_empty() {
+            s.device_activation.failover_queue.remove(app_type);
+        } else {
+            s.device_activation
+                .failover_queue
+                .insert(app_type.to_string(), provider_ids);
+        }
+    })
+}
+
+/// 判断 provider 是否在 failover 队列中。
+pub fn is_in_failover_queue(app_type: &str, provider_id: &str) -> bool {
+    get_failover_queue(app_type)
+        .iter()
+        .any(|p| p == provider_id)
+}
+
+/// 添加 provider 到 failover 队列（去重，追加到末尾）。
+pub fn add_to_failover_queue(app_type: &str, provider_id: &str) -> Result<(), AppError> {
+    mutate_settings(|s| {
+        let queue = s
+            .device_activation
+            .failover_queue
+            .entry(app_type.to_string())
+            .or_default();
+        if !queue.iter().any(|p| p == provider_id) {
+            queue.push(provider_id.to_string());
+        }
+    })
+}
+
+/// 从 failover 队列移除 provider。
+pub fn remove_from_failover_queue(app_type: &str, provider_id: &str) -> Result<(), AppError> {
+    mutate_settings(|s| {
+        if let Some(queue) = s.device_activation.failover_queue.get_mut(app_type) {
+            queue.retain(|p| p != provider_id);
+            if queue.is_empty() {
+                s.device_activation.failover_queue.remove(app_type);
+            }
+        }
+    })
+}
+
+/// 清空指定 app 的 failover 队列。
+pub fn clear_failover_queue(app_type: &str) -> Result<(), AppError> {
+    mutate_settings(|s| {
+        s.device_activation.failover_queue.remove(app_type);
+    })
+}
+
+/// 获取 MCP server 的 per-app 启用标志。未记录的返回全 false。
+pub fn get_mcp_apps(mcp_id: &str) -> AppFlags {
+    settings_store()
+        .read()
+        .ok()
+        .and_then(|s| s.device_activation.mcp_apps.get(mcp_id).cloned())
+        .unwrap_or_else(AppFlags::all_false)
+}
+
+/// 设置 MCP server 的 per-app 启用标志。全 false 时移除条目以保持紧凑。
+pub fn set_mcp_apps(mcp_id: &str, flags: AppFlags) -> Result<(), AppError> {
+    mutate_settings(|s| {
+        if flags.claude || flags.codex || flags.gemini || flags.opencode || flags.hermes {
+            s.device_activation
+                .mcp_apps
+                .insert(mcp_id.to_string(), flags);
+        } else {
+            s.device_activation.mcp_apps.remove(mcp_id);
+        }
+    })
+}
+
+/// 获取 skill 的 per-app 启用标志。未记录的返回全 false。
+pub fn get_skill_apps(skill_id: &str) -> AppFlags {
+    settings_store()
+        .read()
+        .ok()
+        .and_then(|s| s.device_activation.skill_apps.get(skill_id).cloned())
+        .unwrap_or_else(AppFlags::all_false)
+}
+
+/// 设置 skill 的 per-app 启用标志。全 false 时移除条目。
+pub fn set_skill_apps(skill_id: &str, flags: AppFlags) -> Result<(), AppError> {
+    mutate_settings(|s| {
+        if flags.claude || flags.codex || flags.gemini || flags.opencode || flags.hermes {
+            s.device_activation
+                .skill_apps
+                .insert(skill_id.to_string(), flags);
+        } else {
+            s.device_activation.skill_apps.remove(skill_id);
+        }
+    })
+}
+
+/// 删除指定 skill 的激活记录（skill 被删除时调用）。
+pub fn remove_skill_apps(skill_id: &str) -> Result<(), AppError> {
+    mutate_settings(|s| {
+        s.device_activation.skill_apps.remove(skill_id);
+    })
+}
+
+/// 删除指定 MCP 的激活记录（MCP 被删除时调用）。
+pub fn remove_mcp_apps(mcp_id: &str) -> Result<(), AppError> {
+    mutate_settings(|s| {
+        s.device_activation.mcp_apps.remove(mcp_id);
+    })
+}
+
+// ===== OMO「分类内当前」provider 管理 =====
+
+fn omo_key(app_type: &str, category: &str) -> String {
+    format!("{app_type}:{category}")
+}
+
+/// 获取指定 (app, category) 下当前的 OMO provider id。
+pub fn get_omo_current(app_type: &str, category: &str) -> Option<String> {
+    settings_store()
+        .read()
+        .ok()
+        .and_then(|s| s.device_activation.omo_current.get(&omo_key(app_type, category)).cloned())
+}
+
+/// 设置指定 (app, category) 下当前的 OMO provider id（None 表示清除该 category 的 current）。
+pub fn set_omo_current(
+    app_type: &str,
+    category: &str,
+    provider_id: Option<&str>,
+) -> Result<(), AppError> {
+    mutate_settings(|s| {
+        let key = omo_key(app_type, category);
+        match provider_id {
+            Some(id) => {
+                s.device_activation.omo_current.insert(key, id.to_string());
+            }
+            None => {
+                s.device_activation.omo_current.remove(&key);
+            }
+        }
+    })
+}
+
 // ===== Skill 同步方式管理函数 =====
 
 /// 获取 Skill 同步方式配置
@@ -1142,5 +1483,41 @@ mod tests {
         .expect("visible apps");
 
         assert!(!visible.is_visible(&AppType::ClaudeDesktop));
+    }
+}
+
+#[cfg(test)]
+mod deserialize_regression_tests {
+    use super::*;
+
+    #[test]
+    fn parses_old_settings_json_with_webdav_and_s3() {
+        let old_json = r#"{
+            "showInTray": true,
+            "minimizeToTrayOnClose": true,
+            "useAppWindowControls": false,
+            "enableClaudePluginIntegration": false,
+            "skipClaudeOnboarding": false,
+            "launchOnStartup": false,
+            "silentStartup": false,
+            "enableLocalProxy": true,
+            "language": "zh",
+            "currentProviderClaude": "abc-123",
+            "webdavSync": {"enabled": true, "autoSync": false, "baseUrl": "https://dav.example.com", "username": "user", "password": "pass", "remoteRoot": "cc-switch-sync", "profile": "default", "status": {}},
+            "s3Sync": {"enabled": false, "autoSync": false, "region": "us-east-1", "bucket": "mybucket", "accessKeyId": "ak", "secretAccessKey": "sk", "endpoint": "", "remoteRoot": "cc-switch-sync", "profile": "default"},
+            "backupIntervalHours": 24,
+            "backupRetainCount": 10,
+            "preferredTerminal": "iterm2"
+        }"#;
+        let result: Result<AppSettings, _> = serde_json::from_str(old_json);
+        match result {
+            Ok(s) => {
+                assert!(s.webdav_sync.is_some(), "webdavSync must parse");
+                assert!(s.s3_sync.is_some(), "s3Sync must parse");
+                assert_eq!(s.backup_interval_hours, Some(24));
+                assert_eq!(s.preferred_terminal.as_deref(), Some("iterm2"));
+            }
+            Err(e) => panic!("FAILED to parse old settings JSON: {e}"),
+        }
     }
 }

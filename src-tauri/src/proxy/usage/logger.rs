@@ -34,6 +34,9 @@ pub struct RequestLog {
     pub is_streaming: bool,
     /// 成本倍数
     pub cost_multiplier: String,
+    /// 产生该请求的设备 ID（v12+）。None 时回退到本机 device_id()。
+    #[allow(dead_code)]
+    pub device_id: Option<String>,
 }
 
 /// 使用量记录器
@@ -70,6 +73,10 @@ impl<'a> UsageLogger<'a> {
             };
 
         let created_at = chrono::Utc::now().timestamp();
+        let device_id = log
+            .device_id
+            .clone()
+            .unwrap_or_else(|| crate::settings::device_id().to_string());
 
         conn.execute(
             "INSERT OR REPLACE INTO proxy_request_logs (
@@ -77,8 +84,8 @@ impl<'a> UsageLogger<'a> {
                 input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
                 input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd, total_cost_usd,
                 latency_ms, first_token_ms, status_code, error_message, session_id,
-                provider_type, is_streaming, cost_multiplier, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+                provider_type, is_streaming, cost_multiplier, created_at, device_id
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
             rusqlite::params![
                 log.request_id,
                 log.provider_id,
@@ -104,6 +111,7 @@ impl<'a> UsageLogger<'a> {
                 log.is_streaming as i64,
                 log.cost_multiplier,
                 created_at,
+                device_id,
             ],
         )
         .map_err(|e| AppError::Database(format!("记录请求日志失败: {e}")))?;
@@ -147,6 +155,7 @@ impl<'a> UsageLogger<'a> {
             provider_type: None,
             is_streaming: false,
             cost_multiplier: "1.0".to_string(),
+            device_id: None,
         };
 
         self.log_request(&log)
@@ -188,6 +197,7 @@ impl<'a> UsageLogger<'a> {
             provider_type,
             is_streaming,
             cost_multiplier: "1.0".to_string(),
+            device_id: None,
         };
 
         self.log_request(&log)
@@ -356,6 +366,7 @@ impl<'a> UsageLogger<'a> {
             provider_type,
             is_streaming,
             cost_multiplier: cost_multiplier.to_string(),
+            device_id: None,
         };
 
         self.log_request(&log)

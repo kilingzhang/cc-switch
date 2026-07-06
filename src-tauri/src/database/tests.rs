@@ -194,11 +194,10 @@ fn schema_migration_adds_missing_columns_for_providers() {
     Database::apply_schema_migrations_on_conn(&conn).expect("apply migrations");
 
     // 验证关键新增列已补齐
+    // v12: is_current / in_failover_queue / mcp enabled_* 已迁出 DB，改为断言这些列已被移除
     for (table, column) in [
         ("providers", "meta"),
-        ("providers", "is_current"),
         ("provider_endpoints", "added_at"),
-        ("mcp_servers", "enabled_gemini"),
         ("prompts", "updated_at"),
         ("skills", "installed_at"),
         ("skill_repos", "enabled"),
@@ -206,6 +205,19 @@ fn schema_migration_adds_missing_columns_for_providers() {
         assert!(
             Database::has_column(&conn, table, column).expect("check column"),
             "{table}.{column} should exist after migration"
+        );
+    }
+    // v12：激活列不应再存在于 DB（已迁至本地 settings）
+    for (table, column) in [
+        ("providers", "is_current"),
+        ("providers", "in_failover_queue"),
+        ("mcp_servers", "enabled_claude"),
+        ("mcp_servers", "enabled_gemini"),
+        ("skills", "enabled_claude"),
+    ] {
+        assert!(
+            !Database::has_column(&conn, table, column).expect("check column removed"),
+            "{table}.{column} should NOT exist after v12 migration"
         );
     }
 
@@ -232,10 +244,11 @@ fn schema_migration_aligns_column_defaults_and_types() {
 
     Database::apply_schema_migrations_on_conn(&conn).expect("apply migrations");
 
-    let is_current = get_column_info(&conn, "providers", "is_current");
-    assert_eq!(is_current.r#type, "BOOLEAN");
-    assert_eq!(is_current.notnull, 1);
-    assert_eq!(normalize_default(&is_current.default).as_deref(), Some("0"));
+    // v12: providers.is_current 已迁出 DB，改测 providers.meta 的约束
+    let meta = get_column_info(&conn, "providers", "meta");
+    assert_eq!(meta.r#type, "TEXT");
+    assert_eq!(meta.notnull, 1);
+    assert_eq!(normalize_default(&meta.default).as_deref(), Some("{}"));
 
     let tags = get_column_info(&conn, "mcp_servers", "tags");
     assert_eq!(tags.r#type, "TEXT");
@@ -524,20 +537,23 @@ fn migration_from_v3_8_schema_v1_to_current_schema_v3() {
     );
 
     // v1 -> v2：providers 新增字段必须补齐
+    // v12: providers 的激活列（is_current / in_failover_queue）和历史残留列
+    // （cost_multiplier / limit_* / provider_type）已清理，只保留定义列。
     for column in [
+        "is_current",
+        "in_failover_queue",
         "cost_multiplier",
         "limit_daily_usd",
         "limit_monthly_usd",
         "provider_type",
-        "in_failover_queue",
     ] {
         assert!(
-            Database::has_column(&conn, "providers", column).expect("check column"),
-            "providers.{column} should exist after migration"
+            !Database::has_column(&conn, "providers", column).expect("check column removed"),
+            "providers.{column} should NOT exist after v12 migration"
         );
     }
 
-    // 旧 provider 不应丢失，且新增字段应有默认值
+    // 旧 provider 不应丢失
     let provider_count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM providers WHERE id = 'p1' AND app_type = 'claude'",
@@ -547,19 +563,15 @@ fn migration_from_v3_8_schema_v1_to_current_schema_v3() {
         .expect("count providers");
     assert_eq!(provider_count, 1);
 
-    let cost_multiplier: String = conn
-        .query_row(
-            "SELECT cost_multiplier FROM providers WHERE id = 'p1' AND app_type = 'claude'",
-            [],
-            |r| r.get(0),
-        )
-        .expect("read cost_multiplier");
-    assert_eq!(cost_multiplier, "1.0");
-
     // v2 -> v3：skills 表重建为统一结构，并设置 pending 标记（后续由启动时扫描文件系统重建数据）
+    // v12: skills.enabled_claude 已迁出 DB，但 directory 列（v3+ 结构标志）应存在。
     assert!(
-        Database::has_column(&conn, "skills", "enabled_claude").expect("check skills v3 column"),
-        "skills table should be migrated to v3 structure"
+        Database::has_column(&conn, "skills", "directory").expect("check skills v3 column"),
+        "skills table should be migrated to v3+ structure (directory column present)"
+    );
+    assert!(
+        !Database::has_column(&conn, "skills", "enabled_claude").expect("check skills v12"),
+        "skills.enabled_claude should be removed after v12 migration"
     );
     let skills_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM skills", [], |r| r.get(0))

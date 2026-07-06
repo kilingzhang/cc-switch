@@ -473,7 +473,7 @@ impl Database {
     }
 
     /// 获取表的列名列表
-    fn get_table_columns(conn: &Connection, table: &str) -> Result<Vec<String>, AppError> {
+    pub(crate) fn get_table_columns(conn: &Connection, table: &str) -> Result<Vec<String>, AppError> {
         let mut stmt = conn
             .prepare(&format!("PRAGMA table_info(\"{table}\")"))
             .map_err(|e| AppError::Database(e.to_string()))?;

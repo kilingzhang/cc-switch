@@ -16,6 +16,7 @@ pub fn get_usage_summary(
     app_type: Option<String>,
     provider_name: Option<String>,
     model: Option<String>,
+    device_id: Option<String>,
 ) -> Result<UsageSummary, AppError> {
     state.db.get_usage_summary(
         start_date,
@@ -23,6 +24,7 @@ pub fn get_usage_summary(
         app_type.as_deref(),
         provider_name.as_deref(),
         model.as_deref(),
+        device_id.as_deref(),
     )
 }
 
@@ -34,12 +36,14 @@ pub fn get_usage_summary_by_app(
     end_date: Option<i64>,
     provider_name: Option<String>,
     model: Option<String>,
+    device_id: Option<String>,
 ) -> Result<Vec<UsageSummaryByApp>, AppError> {
     state.db.get_usage_summary_by_app(
         start_date,
         end_date,
         provider_name.as_deref(),
         model.as_deref(),
+        device_id.as_deref(),
     )
 }
 
@@ -52,6 +56,7 @@ pub fn get_usage_trends(
     app_type: Option<String>,
     provider_name: Option<String>,
     model: Option<String>,
+    device_id: Option<String>,
 ) -> Result<Vec<DailyStats>, AppError> {
     state.db.get_daily_trends(
         start_date,
@@ -59,6 +64,7 @@ pub fn get_usage_trends(
         app_type.as_deref(),
         provider_name.as_deref(),
         model.as_deref(),
+        device_id.as_deref(),
     )
 }
 
@@ -71,6 +77,7 @@ pub fn get_provider_stats(
     app_type: Option<String>,
     provider_name: Option<String>,
     model: Option<String>,
+    device_id: Option<String>,
 ) -> Result<Vec<ProviderStats>, AppError> {
     state.db.get_provider_stats(
         start_date,
@@ -78,6 +85,7 @@ pub fn get_provider_stats(
         app_type.as_deref(),
         provider_name.as_deref(),
         model.as_deref(),
+        device_id.as_deref(),
     )
 }
 
@@ -90,8 +98,29 @@ pub fn get_model_stats(
     app_type: Option<String>,
     provider_name: Option<String>,
     model: Option<String>,
+    device_id: Option<String>,
 ) -> Result<Vec<ModelStats>, AppError> {
     state.db.get_model_stats(
+        start_date,
+        end_date,
+        app_type.as_deref(),
+        provider_name.as_deref(),
+        model.as_deref(),
+        device_id.as_deref(),
+    )
+}
+
+/// 按设备维度获取使用量汇总（v12+，用于设备分组展示）
+#[tauri::command]
+pub fn get_usage_summary_by_device(
+    state: State<'_, AppState>,
+    start_date: Option<i64>,
+    end_date: Option<i64>,
+    app_type: Option<String>,
+    provider_name: Option<String>,
+    model: Option<String>,
+) -> Result<Vec<UsageSummaryByDevice>, AppError> {
+    state.db.get_usage_summary_by_device(
         start_date,
         end_date,
         app_type.as_deref(),

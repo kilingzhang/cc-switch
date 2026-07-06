@@ -4,6 +4,7 @@ use crate::provider::{Provider, ProviderMeta};
 use indexmap::IndexMap;
 use rusqlite::params;
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 
 type OmoProviderRow = (
     String,
@@ -23,10 +24,15 @@ impl Database {
     ) -> Result<IndexMap<String, Provider>, AppError> {
         let conn = lock_conn!(self.conn);
         let mut stmt = conn.prepare(
-            "SELECT id, name, settings_config, website_url, category, created_at, sort_index, notes, icon, icon_color, meta, in_failover_queue
+            "SELECT id, name, settings_config, website_url, category, created_at, sort_index, notes, icon, icon_color, meta
              FROM providers WHERE app_type = ?1
              ORDER BY COALESCE(sort_index, 999999), created_at ASC, id ASC"
         ).map_err(|e| AppError::Database(e.to_string()))?;
+
+        // v12: in_failover_queue 从本地 settings 读取（已迁出 DB）
+        let failover_ids: HashSet<String> = crate::settings::get_failover_queue(app_type)
+            .into_iter()
+            .collect();
 
         let provider_iter = stmt
             .query_map(params![app_type], |row| {
@@ -41,7 +47,6 @@ impl Database {
                 let icon: Option<String> = row.get(8)?;
                 let icon_color: Option<String> = row.get(9)?;
                 let meta_str: String = row.get(10)?;
-                let in_failover_queue: bool = row.get(11)?;
 
                 let settings_config =
                     serde_json::from_str(&settings_config_str).unwrap_or(serde_json::Value::Null);
@@ -49,28 +54,53 @@ impl Database {
 
                 Ok((
                     id,
-                    Provider {
-                        id: "".to_string(), // Placeholder, set below
-                        name,
-                        settings_config,
-                        website_url,
-                        category,
-                        created_at,
-                        sort_index,
-                        notes,
-                        meta: Some(meta),
-                        icon,
-                        icon_color,
-                        in_failover_queue,
-                    },
+                    name,
+                    settings_config,
+                    website_url,
+                    category,
+                    created_at,
+                    sort_index,
+                    notes,
+                    icon,
+                    icon_color,
+                    meta_str,
+                    meta,
                 ))
             })
             .map_err(|e| AppError::Database(e.to_string()))?;
 
         let mut providers = IndexMap::new();
         for provider_res in provider_iter {
-            let (id, mut provider) = provider_res.map_err(|e| AppError::Database(e.to_string()))?;
-            provider.id = id.clone();
+            let (
+                id,
+                name,
+                settings_config,
+                website_url,
+                category,
+                created_at,
+                sort_index,
+                notes,
+                icon,
+                icon_color,
+                _meta_str,
+                meta,
+            ) = provider_res.map_err(|e| AppError::Database(e.to_string()))?;
+
+            let in_failover_queue = failover_ids.contains(&id);
+            let mut provider = Provider {
+                id: id.clone(),
+                name,
+                settings_config,
+                website_url,
+                category,
+                created_at,
+                sort_index,
+                notes,
+                meta: Some(meta),
+                icon,
+                icon_color,
+                in_failover_queue,
+            };
 
             let mut stmt_endpoints = conn.prepare(
                 "SELECT url, added_at FROM provider_endpoints WHERE provider_id = ?1 AND app_type = ?2 ORDER BY added_at ASC, url ASC"
@@ -109,21 +139,12 @@ impl Database {
     }
 
     pub fn get_current_provider(&self, app_type: &str) -> Result<Option<String>, AppError> {
-        let conn = lock_conn!(self.conn);
-        let mut stmt = conn
-            .prepare("SELECT id FROM providers WHERE app_type = ?1 AND is_current = 1 LIMIT 1")
-            .map_err(|e| AppError::Database(e.to_string()))?;
-
-        let mut rows = stmt
-            .query(params![app_type])
-            .map_err(|e| AppError::Database(e.to_string()))?;
-
-        if let Some(row) = rows.next().map_err(|e| AppError::Database(e.to_string()))? {
-            Ok(Some(
-                row.get(0).map_err(|e| AppError::Database(e.to_string()))?,
-            ))
-        } else {
-            Ok(None)
+        // v12: is_current 已迁出 DB，当前 provider 完全由本地 settings 决定。
+        // 本函数保留作为 get_effective_current_provider 的兜底入口，直接读 settings。
+        use crate::app_config::AppType;
+        match AppType::from_str(app_type) {
+            Ok(app_enum) => Ok(crate::settings::get_current_provider(&app_enum)),
+            Err(_) => Ok(None),
         }
     }
 
@@ -134,7 +155,7 @@ impl Database {
     ) -> Result<Option<Provider>, AppError> {
         let conn = lock_conn!(self.conn);
         let result = conn.query_row(
-            "SELECT name, settings_config, website_url, category, created_at, sort_index, notes, icon, icon_color, meta, in_failover_queue
+            "SELECT name, settings_config, website_url, category, created_at, sort_index, notes, icon, icon_color, meta
              FROM providers WHERE id = ?1 AND app_type = ?2",
             params![id, app_type],
             |row| {
@@ -148,7 +169,6 @@ impl Database {
                 let icon: Option<String> = row.get(7)?;
                 let icon_color: Option<String> = row.get(8)?;
                 let meta_str: String = row.get(9)?;
-                let in_failover_queue: bool = row.get(10)?;
 
                 let settings_config = serde_json::from_str(&settings_config_str).unwrap_or(serde_json::Value::Null);
                 let meta: ProviderMeta = serde_json::from_str(&meta_str).unwrap_or_default();
@@ -165,13 +185,17 @@ impl Database {
                     meta: Some(meta),
                     icon,
                     icon_color,
-                    in_failover_queue,
+                    in_failover_queue: false, // 由下方 settings 注入
                 })
             },
         );
 
         match result {
-            Ok(provider) => Ok(Some(provider)),
+            Ok(mut provider) => {
+                // v12: in_failover_queue 从本地 settings 读取
+                provider.in_failover_queue = crate::settings::is_in_failover_queue(app_type, id);
+                Ok(Some(provider))
+            }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(AppError::Database(e.to_string())),
         }
@@ -186,19 +210,18 @@ impl Database {
         let mut meta_clone = provider.meta.clone().unwrap_or_default();
         let endpoints = std::mem::take(&mut meta_clone.custom_endpoints);
 
-        let existing: Option<(bool, bool)> = tx
+        // v12: providers 表已无 is_current / in_failover_queue 列。
+        // 仅判断行是否存在以决定 UPDATE vs INSERT；激活状态由调用方通过
+        // set_current_provider / failover 队列 API 单独管理。
+        let exists: bool = tx
             .query_row(
-                "SELECT is_current, in_failover_queue FROM providers WHERE id = ?1 AND app_type = ?2",
+                "SELECT 1 FROM providers WHERE id = ?1 AND app_type = ?2",
                 params![provider.id, app_type],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |_| Ok(()),
             )
-            .ok();
+            .is_ok();
 
-        let is_update = existing.is_some();
-        let (is_current, in_failover_queue) =
-            existing.unwrap_or((false, provider.in_failover_queue));
-
-        if is_update {
+        if exists {
             tx.execute(
                 "UPDATE providers SET
                     name = ?1,
@@ -210,10 +233,8 @@ impl Database {
                     notes = ?7,
                     icon = ?8,
                     icon_color = ?9,
-                    meta = ?10,
-                    is_current = ?11,
-                    in_failover_queue = ?12
-                WHERE id = ?13 AND app_type = ?14",
+                    meta = ?10
+                WHERE id = ?11 AND app_type = ?12",
                 params![
                     provider.name,
                     serde_json::to_string(&provider.settings_config).map_err(|e| {
@@ -229,8 +250,6 @@ impl Database {
                     serde_json::to_string(&meta_clone).map_err(|e| AppError::Database(format!(
                         "Failed to serialize meta: {e}"
                     )))?,
-                    is_current,
-                    in_failover_queue,
                     provider.id,
                     app_type,
                 ],
@@ -240,8 +259,8 @@ impl Database {
             tx.execute(
                 "INSERT INTO providers (
                     id, app_type, name, settings_config, website_url, category,
-                    created_at, sort_index, notes, icon, icon_color, meta, is_current, in_failover_queue
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                    created_at, sort_index, notes, icon, icon_color, meta
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     provider.id,
                     app_type,
@@ -257,8 +276,6 @@ impl Database {
                     provider.icon_color,
                     serde_json::to_string(&meta_clone)
                         .map_err(|e| AppError::Database(format!("Failed to serialize meta: {e}")))?,
-                    is_current,
-                    in_failover_queue,
                 ],
             )
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -271,6 +288,12 @@ impl Database {
                 )
                 .map_err(|e| AppError::Database(e.to_string()))?;
             }
+        }
+
+        // 若传入 provider 在 failover 队列中（新增 provider 时），同步到 settings。
+        // 已存在的 provider 的 failover 状态由专门的队列 API 管理，这里仅在首次落库时兜底。
+        if !exists && provider.in_failover_queue {
+            let _ = crate::settings::add_to_failover_queue(app_type, &provider.id);
         }
 
         tx.commit().map_err(|e| AppError::Database(e.to_string()))?;
@@ -288,25 +311,12 @@ impl Database {
     }
 
     pub fn set_current_provider(&self, app_type: &str, id: &str) -> Result<(), AppError> {
-        let mut conn = lock_conn!(self.conn);
-        let tx = conn
-            .transaction()
-            .map_err(|e| AppError::Database(e.to_string()))?;
-
-        tx.execute(
-            "UPDATE providers SET is_current = 0 WHERE app_type = ?1",
-            params![app_type],
-        )
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-        tx.execute(
-            "UPDATE providers SET is_current = 1 WHERE id = ?1 AND app_type = ?2",
-            params![id, app_type],
-        )
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-        tx.commit().map_err(|e| AppError::Database(e.to_string()))?;
-        Ok(())
+        // v12: is_current 已迁出 DB，当前 provider 写入设备级 settings。
+        use crate::app_config::AppType;
+        match AppType::from_str(app_type) {
+            Ok(app_enum) => crate::settings::set_current_provider(&app_enum, Some(id)),
+            Err(_) => Ok(()),
+        }
     }
 
     pub fn update_provider_settings_config(
@@ -366,40 +376,33 @@ impl Database {
         provider_id: &str,
         category: &str,
     ) -> Result<(), AppError> {
-        let mut conn = lock_conn!(self.conn);
-        let tx = conn
-            .transaction()
-            .map_err(|e| AppError::Database(e.to_string()))?;
-        tx.execute(
-            "UPDATE providers SET is_current = 0 WHERE app_type = ?1 AND category = ?2",
-            params![app_type, category],
-        )
-        .map_err(|e| AppError::Database(e.to_string()))?;
-        // OMO ↔ OMO Slim mutually exclusive: deactivate the opposite category
+        // v12: 校验 provider 存在性后，写入设备级 settings 的 omo_current。
+        let conn = lock_conn!(self.conn);
+        let exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM providers WHERE id = ?1 AND app_type = ?2 AND category = ?3",
+                params![provider_id, app_type, category],
+                |_| Ok(()),
+            )
+            .is_ok();
+        if !exists {
+            return Err(AppError::Database(format!(
+                "Failed to set {category} provider current: provider '{provider_id}' not found in app '{app_type}'"
+            )));
+        }
+
+        // 设置本 category 的 current
+        crate::settings::set_omo_current(app_type, category, Some(provider_id))?;
+
+        // OMO ↔ OMO Slim mutually exclusive: 清除对侧 category 的 current
         let opposite = match category {
             "omo" => Some("omo-slim"),
             "omo-slim" => Some("omo"),
             _ => None,
         };
         if let Some(opp) = opposite {
-            tx.execute(
-                "UPDATE providers SET is_current = 0 WHERE app_type = ?1 AND category = ?2",
-                params![app_type, opp],
-            )
-            .map_err(|e| AppError::Database(e.to_string()))?;
+            crate::settings::set_omo_current(app_type, opp, None)?;
         }
-        let updated = tx
-            .execute(
-                "UPDATE providers SET is_current = 1 WHERE id = ?1 AND app_type = ?2 AND category = ?3",
-                params![provider_id, app_type, category],
-            )
-            .map_err(|e| AppError::Database(e.to_string()))?;
-        if updated != 1 {
-            return Err(AppError::Database(format!(
-                "Failed to set {category} provider current: provider '{provider_id}' not found in app '{app_type}'"
-            )));
-        }
-        tx.commit().map_err(|e| AppError::Database(e.to_string()))?;
         Ok(())
     }
 
@@ -409,17 +412,19 @@ impl Database {
         provider_id: &str,
         category: &str,
     ) -> Result<bool, AppError> {
+        // v12: 仅校验 DB 中 provider 存在性，current 状态读 settings。
         let conn = lock_conn!(self.conn);
-        match conn.query_row(
-            "SELECT is_current FROM providers
-             WHERE id = ?1 AND app_type = ?2 AND category = ?3",
-            params![provider_id, app_type, category],
-            |row| row.get(0),
-        ) {
-            Ok(is_current) => Ok(is_current),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
-            Err(e) => Err(AppError::Database(e.to_string())),
+        let exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM providers WHERE id = ?1 AND app_type = ?2 AND category = ?3",
+                params![provider_id, app_type, category],
+                |_| Ok(()),
+            )
+            .is_ok();
+        if !exists {
+            return Ok(false);
         }
+        Ok(crate::settings::get_omo_current(app_type, category).as_deref() == Some(provider_id))
     }
 
     pub fn clear_omo_provider_current(
@@ -428,13 +433,10 @@ impl Database {
         provider_id: &str,
         category: &str,
     ) -> Result<(), AppError> {
-        let conn = lock_conn!(self.conn);
-        conn.execute(
-            "UPDATE providers SET is_current = 0
-             WHERE id = ?1 AND app_type = ?2 AND category = ?3",
-            params![provider_id, app_type, category],
-        )
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        // v12: 仅当该 provider 确实是当前 OMO current 时才清除。
+        if crate::settings::get_omo_current(app_type, category).as_deref() == Some(provider_id) {
+            crate::settings::set_omo_current(app_type, category, None)?;
+        }
         Ok(())
     }
 
@@ -443,13 +445,17 @@ impl Database {
         app_type: &str,
         category: &str,
     ) -> Result<Option<Provider>, AppError> {
+        // v12: current id 来自 settings，定义字段来自 DB。
+        let Some(current_id) = crate::settings::get_omo_current(app_type, category) else {
+            return Ok(None);
+        };
         let conn = lock_conn!(self.conn);
         let row_data: Result<OmoProviderRow, rusqlite::Error> = conn.query_row(
             "SELECT id, name, settings_config, category, created_at, sort_index, notes, meta
              FROM providers
-             WHERE app_type = ?1 AND category = ?2 AND is_current = 1
+             WHERE id = ?1 AND app_type = ?2 AND category = ?3
              LIMIT 1",
-            params![app_type, category],
+            params![current_id, app_type, category],
             |row| {
                 Ok((
                     row.get(0)?,
@@ -467,7 +473,11 @@ impl Database {
         let (id, name, settings_config_str, _row_category, created_at, sort_index, notes, meta_str) =
             match row_data {
                 Ok(v) => v,
-                Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                    // settings 中的 OMO current 在 DB 中已不存在（配置被删/同步覆盖），清理
+                    let _ = crate::settings::set_omo_current(app_type, category, None);
+                    return Ok(None);
+                }
                 Err(e) => return Err(AppError::Database(e.to_string())),
             };
 

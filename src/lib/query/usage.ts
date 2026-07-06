@@ -155,6 +155,7 @@ function normalizeScopeFilters(filters?: UsageScopeFilters): UsageScopeFilters {
     appType: filters?.appType === "all" ? undefined : filters?.appType,
     providerName: filters?.providerName,
     model: filters?.model,
+    deviceId: filters?.deviceId,
   };
 }
 
@@ -181,6 +182,7 @@ export function useUsageSummary(
         effective.appType,
         effective.providerName,
         effective.model,
+        effective.deviceId,
       );
     },
     refetchInterval: options?.refetchInterval ?? DEFAULT_REFETCH_INTERVAL_MS,
@@ -237,6 +239,7 @@ export function useUsageTrends(
         effective.appType,
         effective.providerName,
         effective.model,
+        effective.deviceId,
       );
     },
     refetchInterval: options?.refetchInterval ?? DEFAULT_REFETCH_INTERVAL_MS,
@@ -266,6 +269,7 @@ export function useProviderStats(
         effective.appType,
         effective.providerName,
         effective.model,
+        effective.deviceId,
       );
     },
     refetchInterval: options?.refetchInterval ?? DEFAULT_REFETCH_INTERVAL_MS,
@@ -295,6 +299,7 @@ export function useModelStats(
         effective.appType,
         effective.providerName,
         effective.model,
+        effective.deviceId,
       );
     },
     refetchInterval: options?.refetchInterval ?? DEFAULT_REFETCH_INTERVAL_MS,

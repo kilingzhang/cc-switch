@@ -74,17 +74,19 @@ impl Database {
             let current_id = &manager.current;
 
             for (id, provider) in &manager.providers {
-                let is_current = if id == current_id { 1 } else { 0 };
+                let _is_current = id == current_id;
 
                 // 处理 meta 和 endpoints
                 let mut meta_clone = provider.meta.clone().unwrap_or_default();
                 let endpoints = std::mem::take(&mut meta_clone.custom_endpoints);
 
+                // v12 起 providers 表已无 is_current / in_failover_queue 列，
+                // 当前 provider 选择写入设备级 settings（见下方）。
                 tx.execute(
                     "INSERT OR REPLACE INTO providers (
                         id, app_type, name, settings_config, website_url, category,
-                        created_at, sort_index, notes, icon, icon_color, meta, is_current
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                        created_at, sort_index, notes, icon, icon_color, meta
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                     params![
                         id,
                         app_type,
@@ -98,7 +100,6 @@ impl Database {
                         provider.icon,
                         provider.icon_color,
                         to_json_string(&meta_clone)?,
-                        is_current,
                     ],
                 )
                 .map_err(|e| AppError::Database(format!("Migrate provider failed: {e}")))?;
@@ -113,6 +114,18 @@ impl Database {
                     .map_err(|e| AppError::Database(format!("Migrate endpoint failed: {e}")))?;
                 }
             }
+
+            // 把当前 provider 写入设备级 settings（仅当本地尚未设置时）
+            if !current_id.is_empty() {
+                if let Ok(app_enum) = <crate::app_config::AppType as std::str::FromStr>::from_str(
+                    app_type,
+                ) {
+                    let existing = crate::settings::get_current_provider(&app_enum);
+                    if existing.is_none() {
+                        let _ = crate::settings::set_current_provider(&app_enum, Some(current_id));
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -124,11 +137,11 @@ impl Database {
     ) -> Result<(), AppError> {
         if let Some(servers) = &config.mcp.servers {
             for (id, server) in servers {
+                // v12 起 mcp_servers 表已无 enabled_* 列，启用标志写入设备级 settings。
                 tx.execute(
                     "INSERT OR REPLACE INTO mcp_servers (
-                        id, name, server_config, description, homepage, docs, tags,
-                        enabled_claude, enabled_codex, enabled_gemini
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                        id, name, server_config, description, homepage, docs, tags
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     params![
                         id,
                         server.name,
@@ -137,12 +150,27 @@ impl Database {
                         server.homepage,
                         server.docs,
                         to_json_string(&server.tags)?,
-                        server.apps.claude,
-                        server.apps.codex,
-                        server.apps.gemini,
                     ],
                 )
                 .map_err(|e| AppError::Database(format!("Migrate mcp server failed: {e}")))?;
+
+                // 启用标志写入 settings（仅当本地尚无记录时）
+                let flags = crate::settings::AppFlags {
+                    claude: server.apps.claude,
+                    codex: server.apps.codex,
+                    gemini: server.apps.gemini,
+                    opencode: false, // 旧 config.json 不含 opencode/hermes，保持 false
+                    hermes: false,
+                };
+                let existing = crate::settings::get_mcp_apps(id);
+                let unset = !existing.claude
+                    && !existing.codex
+                    && !existing.gemini
+                    && !existing.opencode
+                    && !existing.hermes;
+                if unset {
+                    let _ = crate::settings::set_mcp_apps(id, flags);
+                }
             }
         }
         Ok(())

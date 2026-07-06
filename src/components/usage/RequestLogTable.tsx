@@ -39,6 +39,7 @@ interface RequestLogTableProps {
   appType?: string;
   providerName?: string;
   model?: string;
+  deviceId?: string;
   refreshIntervalMs: number;
   onRangeChange?: (range: UsageRangeSelection) => void;
 }
@@ -49,6 +50,7 @@ export function RequestLogTable({
   appType: dashboardAppType,
   providerName,
   model,
+  deviceId,
   refreshIntervalMs,
   onRangeChange,
 }: RequestLogTableProps) {
@@ -69,6 +71,7 @@ export function RequestLogTable({
     providerName,
     model,
     statusCode,
+    deviceId,
   };
 
   const { data: result, isLoading } = useRequestLogs({

@@ -16,6 +16,7 @@ interface ModelStatsTableProps {
   appType?: string;
   providerName?: string;
   model?: string;
+  deviceId?: string;
   refreshIntervalMs: number;
 }
 
@@ -24,12 +25,13 @@ export function ModelStatsTable({
   appType,
   providerName,
   model,
+  deviceId,
   refreshIntervalMs,
 }: ModelStatsTableProps) {
   const { t } = useTranslation();
   const { data: stats, isLoading } = useModelStats(
     range,
-    { appType, providerName, model },
+    { appType, providerName, model, deviceId },
     {
       refetchInterval: refreshIntervalMs > 0 ? refreshIntervalMs : false,
     },

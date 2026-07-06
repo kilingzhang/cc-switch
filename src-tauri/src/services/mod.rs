@@ -25,6 +25,8 @@ pub mod subscription;
 pub mod sync_protocol;
 pub mod usage_cache;
 pub mod usage_stats;
+pub mod usage_sync;
+pub mod usage_auto_sync;
 pub mod webdav;
 pub mod webdav_auto_sync;
 pub mod webdav_sync;
@@ -42,5 +44,5 @@ pub use usage_cache::UsageCache;
 #[allow(unused_imports)]
 pub use usage_stats::{
     DailyStats, LogFilters, ModelStats, PaginatedLogs, ProviderLimitStatus, ProviderStats,
-    RequestLogDetail, UsageSummary, UsageSummaryByApp,
+    RequestLogDetail, UsageSummary, UsageSummaryByApp, UsageSummaryByDevice,
 };

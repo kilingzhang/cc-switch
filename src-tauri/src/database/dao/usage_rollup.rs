@@ -101,6 +101,8 @@ impl Database {
                     // 归档触发了表结构变化，前端 30 天前的统计可能跟着变，
                     // 通知一次让 UsageDashboard 重拉数据
                     crate::usage_events::notify_log_recorded();
+                    // v12+: 明细归档为汇总后，触发跨设备用量自动上传
+                    crate::services::usage_auto_sync::notify_rollup_done();
                 }
                 Ok(deleted)
             }
@@ -120,13 +122,13 @@ impl Database {
         // 明细行的这两列可能为 NULL（历史/手工数据），归一为 ''。
         let aggregation_sql = format!(
             "INSERT OR REPLACE INTO usage_daily_rollups
-                (date, app_type, provider_id, model, request_model, pricing_model,
+                (date, app_type, provider_id, model, request_model, pricing_model, device_id,
                  request_count, success_count,
                  input_tokens, output_tokens,
                  cache_read_tokens, cache_creation_tokens,
                  total_cost_usd, avg_latency_ms)
             SELECT
-                d, a, p, m, rm, pm,
+                d, a, p, m, rm, pm, dev,
                 COALESCE(old.request_count, 0) + new_req,
                 COALESCE(old.success_count, 0) + new_succ,
                 COALESCE(old.input_tokens, 0) + new_in,
@@ -145,6 +147,7 @@ impl Database {
                     l.app_type as a, l.provider_id as p, l.model as m,
                     COALESCE(l.request_model, '') as rm,
                     COALESCE(l.pricing_model, '') as pm,
+                    COALESCE(l.device_id, '') as dev,
                     COUNT(*) as new_req,
                     SUM(CASE WHEN l.status_code >= 200 AND l.status_code < 300 THEN 1 ELSE 0 END) as new_succ,
                     COALESCE(SUM(l.input_tokens), 0) as new_in,
@@ -155,12 +158,13 @@ impl Database {
                     COALESCE(AVG(l.latency_ms), 0) as new_lat
                 FROM proxy_request_logs l
                 WHERE l.created_at < ?1 AND {effective_filter}
-                GROUP BY d, a, p, m, rm, pm
+                GROUP BY d, a, p, m, rm, pm, dev
             ) agg
             LEFT JOIN usage_daily_rollups old
                 ON old.date = agg.d AND old.app_type = agg.a
                 AND old.provider_id = agg.p AND old.model = agg.m
-                AND old.request_model = agg.rm AND old.pricing_model = agg.pm"
+                AND old.request_model = agg.rm AND old.pricing_model = agg.pm
+                AND old.device_id = agg.dev"
         );
 
         conn.execute(&aggregation_sql, [cutoff])

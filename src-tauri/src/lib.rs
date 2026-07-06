@@ -945,6 +945,8 @@ pub fn run() {
                 app_state.db.clone(),
                 app.handle().clone(),
             );
+            // v12+: 跨设备用量自动同步 worker（复用 S3 凭证，走独立远端路径）
+            crate::services::usage_auto_sync::start_worker(app_state.db.clone());
             // 将同一个实例注入到全局状态，避免重复创建导致的不一致
             app.manage(app_state);
 
@@ -1382,7 +1384,11 @@ pub fn run() {
             // Usage statistics
             commands::get_usage_summary,
             commands::get_usage_summary_by_app,
+            commands::get_usage_summary_by_device,
             commands::get_usage_trends,
+            commands::usage_sync_upload,
+            commands::usage_sync_download_all,
+            commands::usage_sync_fetch_devices,
             commands::get_provider_stats,
             commands::get_model_stats,
             commands::get_request_logs,

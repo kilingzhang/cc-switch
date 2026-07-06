@@ -35,6 +35,7 @@ interface UsageHeroProps {
   appType?: string;
   providerName?: string;
   model?: string;
+  deviceId?: string;
   refreshIntervalMs: number;
 }
 
@@ -163,10 +164,16 @@ export function UsageHero({
   appType,
   providerName,
   model,
+  deviceId,
   refreshIntervalMs,
 }: UsageHeroProps) {
   const { t, i18n } = useTranslation();
   const lang = getResolvedLang(i18n);
+
+  // Hero aggregates per-app rows, so the device filter is less relevant here;
+  // `useUsageSummaryByApp` does not accept deviceId in its scope type. The prop
+  // is accepted to satisfy the Dashboard's uniform prop passing.
+  void deviceId;
 
   const { data, isLoading } = useUsageSummaryByApp(
     range,

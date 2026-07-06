@@ -16,6 +16,7 @@ interface ProviderStatsTableProps {
   appType?: string;
   providerName?: string;
   model?: string;
+  deviceId?: string;
   refreshIntervalMs: number;
 }
 
@@ -24,12 +25,13 @@ export function ProviderStatsTable({
   appType,
   providerName,
   model,
+  deviceId,
   refreshIntervalMs,
 }: ProviderStatsTableProps) {
   const { t } = useTranslation();
   const { data: stats, isLoading } = useProviderStats(
     range,
-    { appType, providerName, model },
+    { appType, providerName, model, deviceId },
     {
       refetchInterval: refreshIntervalMs > 0 ? refreshIntervalMs : false,
     },

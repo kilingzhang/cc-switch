@@ -2,6 +2,8 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   UsageSummary,
   UsageSummaryByApp,
+  UsageSummaryByDevice,
+  DeviceRegistryEntry,
   DailyStats,
   ProviderStats,
   ModelStats,
@@ -54,6 +56,7 @@ export const usageApi = {
     appType?: string,
     providerName?: string,
     model?: string,
+    deviceId?: string,
   ): Promise<UsageSummary> => {
     return invoke("get_usage_summary", {
       startDate,
@@ -61,6 +64,7 @@ export const usageApi = {
       appType,
       providerName,
       model,
+      deviceId,
     });
   },
 
@@ -69,10 +73,28 @@ export const usageApi = {
     endDate?: number,
     providerName?: string,
     model?: string,
+    deviceId?: string,
   ): Promise<UsageSummaryByApp[]> => {
     return invoke("get_usage_summary_by_app", {
       startDate,
       endDate,
+      providerName,
+      model,
+      deviceId,
+    });
+  },
+
+  getUsageSummaryByDevice: async (
+    startDate?: number,
+    endDate?: number,
+    appType?: string,
+    providerName?: string,
+    model?: string,
+  ): Promise<UsageSummaryByDevice[]> => {
+    return invoke("get_usage_summary_by_device", {
+      startDate,
+      endDate,
+      appType,
       providerName,
       model,
     });
@@ -84,6 +106,7 @@ export const usageApi = {
     appType?: string,
     providerName?: string,
     model?: string,
+    deviceId?: string,
   ): Promise<DailyStats[]> => {
     return invoke("get_usage_trends", {
       startDate,
@@ -91,6 +114,7 @@ export const usageApi = {
       appType,
       providerName,
       model,
+      deviceId,
     });
   },
 
@@ -100,6 +124,7 @@ export const usageApi = {
     appType?: string,
     providerName?: string,
     model?: string,
+    deviceId?: string,
   ): Promise<ProviderStats[]> => {
     return invoke("get_provider_stats", {
       startDate,
@@ -107,6 +132,7 @@ export const usageApi = {
       appType,
       providerName,
       model,
+      deviceId,
     });
   },
 
@@ -116,6 +142,7 @@ export const usageApi = {
     appType?: string,
     providerName?: string,
     model?: string,
+    deviceId?: string,
   ): Promise<ModelStats[]> => {
     return invoke("get_model_stats", {
       startDate,
@@ -123,6 +150,7 @@ export const usageApi = {
       appType,
       providerName,
       model,
+      deviceId,
     });
   },
 
@@ -182,5 +210,22 @@ export const usageApi = {
 
   getDataSourceBreakdown: async (): Promise<DataSourceSummary[]> => {
     return invoke("get_usage_data_sources");
+  },
+
+  // ─── 跨设备用量同步（v12+）───
+  // 复用 S3 sync 凭证，走独立的 usage/v1/ 远端路径
+  usageSyncUpload: async (): Promise<{ status: string }> => {
+    return invoke("usage_sync_upload");
+  },
+
+  usageSyncDownloadAll: async (): Promise<{
+    status: string;
+    mergedDevices: number;
+  }> => {
+    return invoke("usage_sync_download_all");
+  },
+
+  usageSyncFetchDevices: async (): Promise<DeviceRegistryEntry[]> => {
+    return invoke("usage_sync_fetch_devices");
   },
 };

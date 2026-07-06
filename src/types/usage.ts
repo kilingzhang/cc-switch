@@ -34,6 +34,8 @@ export interface RequestLog {
   errorMessage?: string;
   createdAt: number;
   dataSource?: string;
+  /** 产生该请求的设备 ID（v12+） */
+  deviceId?: string;
 }
 
 export interface SessionSyncResult {
@@ -84,6 +86,19 @@ export interface UsageSummaryByApp {
   summary: UsageSummary;
 }
 
+/** 按设备拆分的使用量汇总（v12+ 设备维度） */
+export interface UsageSummaryByDevice {
+  deviceId: string;
+  summary: UsageSummary;
+}
+
+/** 远端设备注册表条目（跨设备用量同步） */
+export interface DeviceRegistryEntry {
+  deviceId: string;
+  deviceName: string;
+  lastUploadAt: string;
+}
+
 export interface DailyStats {
   date: string;
   requestCount: number;
@@ -120,6 +135,8 @@ export interface LogFilters {
   statusCode?: number;
   startDate?: number;
   endDate?: number;
+  /** 设备筛选（v12+） */
+  deviceId?: string;
 }
 
 /**
@@ -134,6 +151,8 @@ export interface UsageScopeFilters {
   appType?: string;
   providerName?: string;
   model?: string;
+  /** 设备筛选（v12+）。undefined = 全部设备 */
+  deviceId?: string;
 }
 
 export interface ProviderLimitStatus {

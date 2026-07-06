@@ -3,6 +3,7 @@
 //! 负责数据库表结构的创建和版本迁移。
 
 use super::{lock_conn, Database, SCHEMA_VERSION};
+use crate::app_config::AppType;
 use crate::error::AppError;
 use rusqlite::{params, Connection};
 use serde::Serialize;
@@ -22,7 +23,7 @@ impl Database {
 
     /// 在指定连接上创建表（供迁移和测试使用）
     pub(crate) fn create_tables_on_conn(conn: &Connection) -> Result<(), AppError> {
-        // 1. Providers 表
+        // 1. Providers 表（v12：激活列 is_current / in_failover_queue 已迁至本地 settings）
         conn.execute(
             "CREATE TABLE IF NOT EXISTS providers (
                 id TEXT NOT NULL,
@@ -37,8 +38,6 @@ impl Database {
                 icon TEXT,
                 icon_color TEXT,
                 meta TEXT NOT NULL DEFAULT '{}',
-                is_current BOOLEAN NOT NULL DEFAULT 0,
-                in_failover_queue BOOLEAN NOT NULL DEFAULT 0,
                 PRIMARY KEY (id, app_type)
             )",
             [],
@@ -59,14 +58,11 @@ impl Database {
         )
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        // 3. MCP Servers 表
+        // 3. MCP Servers 表（v12：5 个 enabled_* 列已迁至本地 settings）
         conn.execute(
             "CREATE TABLE IF NOT EXISTS mcp_servers (
             id TEXT PRIMARY KEY, name TEXT NOT NULL, server_config TEXT NOT NULL,
-            description TEXT, homepage TEXT, docs TEXT, tags TEXT NOT NULL DEFAULT '[]',
-            enabled_claude BOOLEAN NOT NULL DEFAULT 0, enabled_codex BOOLEAN NOT NULL DEFAULT 0,
-            enabled_gemini BOOLEAN NOT NULL DEFAULT 0, enabled_opencode BOOLEAN NOT NULL DEFAULT 0,
-            enabled_hermes BOOLEAN NOT NULL DEFAULT 0
+            description TEXT, homepage TEXT, docs TEXT, tags TEXT NOT NULL DEFAULT '[]'
         )",
             [],
         )
@@ -79,7 +75,7 @@ impl Database {
             PRIMARY KEY (id, app_type)
         )", []).map_err(|e| AppError::Database(e.to_string()))?;
 
-        // 5. Skills 表（v3.10.0+ 统一结构）
+        // 5. Skills 表（v3.10.0+ 统一结构；v12：5 个 enabled_* 列已迁至本地 settings）
         conn.execute(
             "CREATE TABLE IF NOT EXISTS skills (
             id TEXT PRIMARY KEY,
@@ -90,11 +86,6 @@ impl Database {
             repo_name TEXT,
             repo_branch TEXT DEFAULT 'main',
             readme_url TEXT,
-            enabled_claude BOOLEAN NOT NULL DEFAULT 0,
-            enabled_codex BOOLEAN NOT NULL DEFAULT 0,
-            enabled_gemini BOOLEAN NOT NULL DEFAULT 0,
-            enabled_opencode BOOLEAN NOT NULL DEFAULT 0,
-            enabled_hermes BOOLEAN NOT NULL DEFAULT 0,
             installed_at INTEGER NOT NULL DEFAULT 0,
             content_hash TEXT,
             updated_at INTEGER NOT NULL DEFAULT 0
@@ -195,7 +186,8 @@ impl Database {
             duration_ms INTEGER, status_code INTEGER NOT NULL, error_message TEXT, session_id TEXT,
             provider_type TEXT, is_streaming INTEGER NOT NULL DEFAULT 0,
             cost_multiplier TEXT NOT NULL DEFAULT '1.0', created_at INTEGER NOT NULL,
-            data_source TEXT NOT NULL DEFAULT 'proxy'
+            data_source TEXT NOT NULL DEFAULT 'proxy',
+            device_id TEXT
         )", []).map_err(|e| AppError::Database(e.to_string()))?;
 
         conn.execute("CREATE INDEX IF NOT EXISTS idx_request_logs_provider ON proxy_request_logs(provider_id, app_type)", [])
@@ -260,6 +252,7 @@ impl Database {
         // 17. Usage Daily Rollups 表 (日聚合统计)
         // request_model 保留路由接管的「客户端别名 → 真实模型」映射维度，
         // pricing_model 保留写入时的计价基准（request 计价模式下与 model 分叉），
+        // device_id 保留跨设备用量归属（v12+），支持分设备筛选/聚合。
         // 否则明细被 prune 后接管计费不可审计；历史行迁移时填 ''（未知）。
         conn.execute(
             "CREATE TABLE IF NOT EXISTS usage_daily_rollups (
@@ -269,6 +262,7 @@ impl Database {
                 model TEXT NOT NULL,
                 request_model TEXT NOT NULL DEFAULT '',
                 pricing_model TEXT NOT NULL DEFAULT '',
+                device_id TEXT NOT NULL DEFAULT '',
                 request_count INTEGER NOT NULL DEFAULT 0,
                 success_count INTEGER NOT NULL DEFAULT 0,
                 input_tokens INTEGER NOT NULL DEFAULT 0,
@@ -277,7 +271,7 @@ impl Database {
                 cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
                 total_cost_usd TEXT NOT NULL DEFAULT '0',
                 avg_latency_ms INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (date, app_type, provider_id, model, request_model, pricing_model)
+                PRIMARY KEY (date, app_type, provider_id, model, request_model, pricing_model, device_id)
             )",
             [],
         )
@@ -341,24 +335,11 @@ impl Database {
             Self::migrate_proxy_config_to_per_app(conn)?;
         }
 
-        // 确保 in_failover_queue 列存在（对于已存在的 v2 数据库）
-        Self::add_column_if_missing(
-            conn,
-            "providers",
-            "in_failover_queue",
-            "BOOLEAN NOT NULL DEFAULT 0",
-        )?;
-
-        // 删除旧的 failover_queue 表（如果存在）
+        // v12 起 providers 表已无 in_failover_queue 列（迁至本地 settings），
+        // 旧的 failover 索引删除；故障转移队列现从 settings.device_activation 读取。
+        let _ = conn.execute("DROP INDEX IF EXISTS idx_providers_failover", []);
         let _ = conn.execute("DROP INDEX IF EXISTS idx_failover_queue_order", []);
         let _ = conn.execute("DROP TABLE IF EXISTS failover_queue", []);
-
-        // 为故障转移队列创建索引（基于 providers 表）
-        let _ = conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_providers_failover
-             ON providers(app_type, in_failover_queue, sort_index)",
-            [],
-        );
 
         Ok(())
     }
@@ -443,6 +424,13 @@ impl Database {
                         log::info!("迁移数据库从 v10 到 v11（usage_daily_rollups 保留 request_model 维度）");
                         Self::migrate_v10_to_v11(conn)?;
                         Self::set_user_version(conn, 11)?;
+                    }
+                    11 => {
+                        log::info!(
+                            "迁移数据库从 v11 到 v12（设备级激活状态迁移至本地 + 用量表加 device_id 维度）"
+                        );
+                        Self::migrate_v11_to_v12(conn)?;
+                        Self::set_user_version(conn, 12)?;
                     }
                     _ => {
                         return Err(AppError::Database(format!(
@@ -896,9 +884,24 @@ impl Database {
     /// 1. 旧数据库只存储安装记录，真正的 skill 文件在文件系统
     /// 2. 直接重建新表结构，后续由 SkillService 在首次启动时扫描文件系统重建数据
     fn migrate_v2_to_v3(conn: &Connection) -> Result<(), AppError> {
-        // 检查是否已经是新结构（通过检查是否有 enabled_claude 列）
+        // 检查是否已经是 v3+ 结构：
+        // - v3~v11：有 enabled_claude 列
+        // - v12+：激活列已迁出，但有 directory 列（区分于 v2 的 directory+app_type 中间结构）
+        // 仅当 skills 表处于 v1->v2 重建后的中间结构（directory + app_type + installed）时才执行。
         if Self::has_column(conn, "skills", "enabled_claude")? {
-            log::info!("skills 表已经是 v3 结构，跳过迁移");
+            log::info!("skills 表已经是 v3+ 结构，跳过迁移");
+            return Ok(());
+        }
+        if !Self::table_exists(conn, "skills")? {
+            log::info!("skills 表不存在，跳过迁移");
+            return Ok(());
+        }
+        // v1->v2 中间结构特征：directory + app_type + installed（无 enabled_claude）
+        // 若缺少 app_type，说明是 fresh-install（v12 CREATE TABLE）或更老结构，跳过
+        if !Self::has_column(conn, "skills", "app_type")?
+            || !Self::has_column(conn, "skills", "installed")?
+        {
+            log::info!("skills 表非 v1->v2 中间结构，跳过 v2->v3 迁移");
             return Ok(());
         }
 
@@ -1267,6 +1270,425 @@ impl Database {
         log::info!(
             "v10 -> v11 迁移完成：usage_daily_rollups 已保留 request_model/pricing_model 维度"
         );
+        Ok(())
+    }
+
+    /// v11 -> v12：把设备级激活状态从 DB 列迁移到本地 settings.json，并为用量表引入 device_id 维度。
+    ///
+    /// 这是一次结构性迁移，包含三件事：
+    /// 1. **回填**：先把 DB 里现有的激活值（is_current、in_failover_queue、mcp/skill enabled_*）
+    ///    读出来写入 settings.json 的 device_activation，避免删列后丢失用户的启用状态。
+    ///    - is_current → current_provider_*（已存在，仅当本地为空时回填）
+    ///    - in_failover_queue → device_activation.failover_queue
+    ///    - mcp enabled_* → device_activation.mcp_apps
+    ///    - skill enabled_* → device_activation.skill_apps
+    /// 2. **用量表**：proxy_request_logs 加 device_id 列；usage_daily_rollups 重建表把 device_id 加入主键，
+    ///    历史行的 device_id 填本地设备 id（迁移前所有行都属于本机）。
+    /// 3. **删列**：providers/mcp_servers/skills 用 rename/create/copy/drop 重建，去掉激活列，
+    ///    使配置同步（db.sql）只携带定义。删列在回填之后，保证不丢数据。
+    fn migrate_v11_to_v12(conn: &Connection) -> Result<(), AppError> {
+        let local_device_id = crate::settings::get_or_create_device_id();
+
+        // ===== 1. 回填激活状态到 settings.json（在删列之前！）=====
+        Self::export_activation_to_settings(conn)?;
+
+        // ===== 2. proxy_request_logs 加 device_id 列 =====
+        if Self::table_exists(conn, "proxy_request_logs")? {
+            Self::add_column_if_missing(conn, "proxy_request_logs", "device_id", "TEXT")?;
+            // 历史行标记为本机
+            let _ = conn.execute(
+                "UPDATE proxy_request_logs SET device_id = ?1 WHERE device_id IS NULL",
+                rusqlite::params![local_device_id],
+            );
+        }
+
+        // ===== 3. usage_daily_rollups 重建表，PK 加 device_id =====
+        if Self::table_exists(conn, "usage_daily_rollups")? {
+            conn.execute_batch(
+                "ALTER TABLE usage_daily_rollups RENAME TO usage_daily_rollups_v11;
+                 CREATE TABLE usage_daily_rollups (
+                     date TEXT NOT NULL,
+                     app_type TEXT NOT NULL,
+                     provider_id TEXT NOT NULL,
+                     model TEXT NOT NULL,
+                     request_model TEXT NOT NULL DEFAULT '',
+                     pricing_model TEXT NOT NULL DEFAULT '',
+                     device_id TEXT NOT NULL DEFAULT '',
+                     request_count INTEGER NOT NULL DEFAULT 0,
+                     success_count INTEGER NOT NULL DEFAULT 0,
+                     input_tokens INTEGER NOT NULL DEFAULT 0,
+                     output_tokens INTEGER NOT NULL DEFAULT 0,
+                     cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                     cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+                     total_cost_usd TEXT NOT NULL DEFAULT '0',
+                     avg_latency_ms INTEGER NOT NULL DEFAULT 0,
+                     PRIMARY KEY (date, app_type, provider_id, model, request_model, pricing_model, device_id)
+                 );
+                 INSERT INTO usage_daily_rollups
+                     (date, app_type, provider_id, model, request_model, pricing_model, device_id,
+                      request_count, success_count, input_tokens, output_tokens,
+                      cache_read_tokens, cache_creation_tokens, total_cost_usd, avg_latency_ms)
+                 SELECT date, app_type, provider_id, model, request_model, pricing_model, '',
+                      request_count, success_count, input_tokens, output_tokens,
+                      cache_read_tokens, cache_creation_tokens, total_cost_usd, avg_latency_ms
+                 FROM usage_daily_rollups_v11;
+                 DROP TABLE usage_daily_rollups_v11;",
+            )
+            .map_err(|e| AppError::Database(format!("v11 -> v12 重建 usage_daily_rollups 失败: {e}")))?;
+            // 历史汇总行标记为本机
+            let _ = conn.execute(
+                "UPDATE usage_daily_rollups SET device_id = ?1 WHERE device_id = ''",
+                rusqlite::params![local_device_id],
+            );
+        }
+
+        // ===== 4. providers：去掉 is_current / in_failover_queue =====
+        // 重建为纯定义表（与 fresh-install CREATE TABLE 一致），保留 (id, app_type) 主键。
+        // 使用动态列交集避免因历史迁移起点不同（LEGACY vs V3.8）导致的列缺失。
+        if Self::table_exists(conn, "providers")?
+            && Self::has_column(conn, "providers", "is_current")?
+        {
+            Self::rebuild_table_to_canonical(
+                conn,
+                "providers",
+                "v11",
+                "id TEXT NOT NULL,
+                 app_type TEXT NOT NULL,
+                 name TEXT NOT NULL,
+                 settings_config TEXT NOT NULL,
+                 website_url TEXT,
+                 category TEXT,
+                 created_at INTEGER,
+                 sort_index INTEGER,
+                 notes TEXT,
+                 icon TEXT,
+                 icon_color TEXT,
+                 meta TEXT NOT NULL DEFAULT '{}',
+                 PRIMARY KEY (id, app_type)",
+                &[
+                    "id", "app_type", "name", "settings_config", "website_url", "category",
+                    "created_at", "sort_index", "notes", "icon", "icon_color", "meta",
+                ],
+            )?;
+        }
+
+        // ===== 5. mcp_servers：去掉 5 个 enabled_* 列 =====
+        // guard 检测任一 enabled_* 列存在即可（不同历史版本可能只补了部分）
+        if Self::table_exists(conn, "mcp_servers")?
+            && (Self::has_column(conn, "mcp_servers", "enabled_claude")?
+                || Self::has_column(conn, "mcp_servers", "enabled_codex")?
+                || Self::has_column(conn, "mcp_servers", "enabled_gemini")?
+                || Self::has_column(conn, "mcp_servers", "enabled_opencode")?
+                || Self::has_column(conn, "mcp_servers", "enabled_hermes")?)
+        {
+            Self::rebuild_table_to_canonical(
+                conn,
+                "mcp_servers",
+                "v11",
+                "id TEXT PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 server_config TEXT NOT NULL,
+                 description TEXT,
+                 homepage TEXT,
+                 docs TEXT,
+                 tags TEXT NOT NULL DEFAULT '[]'",
+                &["id", "name", "server_config", "description", "homepage", "docs", "tags"],
+            )?;
+        }
+
+        // ===== 6. skills：去掉 5 个 enabled_* 列 =====
+        if Self::table_exists(conn, "skills")?
+            && (Self::has_column(conn, "skills", "enabled_claude")?
+                || Self::has_column(conn, "skills", "enabled_codex")?
+                || Self::has_column(conn, "skills", "enabled_gemini")?
+                || Self::has_column(conn, "skills", "enabled_opencode")?
+                || Self::has_column(conn, "skills", "enabled_hermes")?)
+        {
+            Self::rebuild_table_to_canonical(
+                conn,
+                "skills",
+                "v11",
+                "id TEXT PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 description TEXT,
+                 directory TEXT NOT NULL,
+                 repo_owner TEXT,
+                 repo_name TEXT,
+                 repo_branch TEXT DEFAULT 'main',
+                 readme_url TEXT,
+                 installed_at INTEGER NOT NULL DEFAULT 0,
+                 content_hash TEXT,
+                 updated_at INTEGER NOT NULL DEFAULT 0",
+                &[
+                    "id", "name", "description", "directory", "repo_owner", "repo_name",
+                    "repo_branch", "readme_url", "installed_at", "content_hash", "updated_at",
+                ],
+            )?;
+        }
+
+        log::info!(
+            "v11 -> v12 迁移完成：激活状态已迁至本地 settings，用量表已加 device_id 维度，定义表已去除激活列"
+        );
+        Ok(())
+    }
+
+    /// 把表重建为 canonical 定义，仅复制旧表中存在且 target_cols 中列出的列。
+    ///
+    /// 用于 v11->v12 删除激活列的迁移。由于不同历史版本的 DB（v0 起 vs v1 起）
+    /// 经过迁移链后列集合不同，这里取「目标列 ∩ 旧表实际列」作为 SELECT 列表，
+    /// 避免硬编码 SELECT 引用不存在的列（如 website_url 仅在 v1 起的 DB 中存在）。
+    /// canonical_ddl 保证了主键与列约束（NOT NULL / DEFAULT）与 fresh-install 一致。
+    fn rebuild_table_to_canonical(
+        conn: &Connection,
+        table: &str,
+        tmp_suffix: &str,
+        canonical_ddl: &str,
+        target_cols: &[&str],
+    ) -> Result<(), AppError> {
+        Self::validate_identifier(table, "表名")?;
+        let tmp_name = format!("{table}_{tmp_suffix}");
+
+        // 旧表列集合
+        let old_cols: std::collections::HashSet<String> = Self::get_table_columns(conn, table)?
+            .into_iter()
+            .collect();
+        // 取交集（按 target_cols 的顺序，保证列顺序与 canonical DDL 对齐）
+        let copy_cols: Vec<&str> = target_cols
+            .iter()
+            .copied()
+            .filter(|c| old_cols.contains(*c))
+            .collect();
+
+        if copy_cols.is_empty() {
+            return Err(AppError::Database(format!(
+                "重建表 {table} 失败：目标列在旧表中均不存在"
+            )));
+        }
+
+        let cols_list = copy_cols
+            .iter()
+            .map(|c| format!("\"{c}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let batch = format!(
+            "ALTER TABLE \"{table}\" RENAME TO \"{tmp_name}\";
+             CREATE TABLE \"{table}\" ({canonical_ddl});
+             INSERT INTO \"{table}\" ({cols_list})
+             SELECT {cols_list} FROM \"{tmp_name}\";
+             DROP TABLE \"{tmp_name}\";"
+        );
+        conn.execute_batch(&batch)
+            .map_err(|e| AppError::Database(format!("v11 -> v12 重建 {table} 失败: {e}")))?;
+
+        log::info!(
+            "已重建表 {table} 为 canonical 结构，复制 {} 列",
+            copy_cols.len()
+        );
+        Ok(())
+    }
+
+    /// 把 DB 里现存的激活值导出到 settings.json（v11 -> v12 迁移的前置回填）。
+    ///
+    /// 设计要点：
+    /// - **仅当本地 settings 对应字段为空时才回填**，避免覆盖用户在新设备上已有的选择。
+    ///   （典型场景：配置已通过云同步导入，本地 settings 已有激活值 → 不应被 DB 旧值覆盖。）
+    /// - is_current → current_provider_*：每个 app 仅取第一个 is_current=1 的 id。
+    /// - in_failover_queue → failover_queue：按 sort_index 收集。
+    /// - mcp/skill enabled_* → mcp_apps / skill_apps：逐行读 5 个布尔。
+    fn export_activation_to_settings(conn: &Connection) -> Result<(), AppError> {
+        use crate::settings::AppFlags;
+
+        // 收集所有要写回的激活数据，最后一次 mutate_settings 提交，避免多次写文件。
+        let mut activation = crate::settings::get_settings().device_activation.clone();
+        let existing_current = crate::settings::collect_current_providers();
+
+        // --- providers.is_current → current_provider_* ---
+        // 仅当本地尚未设置时回填
+        if Self::table_exists(conn, "providers")?
+            && Self::has_column(conn, "providers", "is_current")?
+        {
+            for (app_str, app_type) in [
+                ("claude", AppType::Claude),
+                ("claude-desktop", AppType::ClaudeDesktop),
+                ("codex", AppType::Codex),
+                ("gemini", AppType::Gemini),
+                ("opencode", AppType::OpenCode),
+                ("openclaw", AppType::OpenClaw),
+                ("hermes", AppType::Hermes),
+            ] {
+                // 本地已有则跳过
+                if existing_current.get(&app_type).cloned().flatten().is_some() {
+                    continue;
+                }
+                let id: Option<String> = conn
+                    .query_row(
+                        "SELECT id FROM providers WHERE app_type = ?1 AND is_current = 1 LIMIT 1",
+                        rusqlite::params![app_str],
+                        |row| row.get(0),
+                    )
+                    .ok();
+                if let Some(id) = id {
+                    let _ = crate::settings::set_current_provider(&app_type, Some(&id));
+                }
+            }
+
+            // --- OMO 分类内 current → omo_current ---
+            // 每个 (app, category) 取 is_current=1 的 provider_id
+            let mut stmt = conn
+                .prepare(
+                    "SELECT app_type, category, id FROM providers
+                     WHERE is_current = 1 AND category IN ('omo', 'omo-slim')",
+                )
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            let omo_rows: Vec<(String, Option<String>, String)> = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(|e| AppError::Database(e.to_string()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            drop(stmt);
+            for (app_str, category, id) in omo_rows {
+                if let Some(cat) = category {
+                    // 仅当本地无记录时回填到 activation 变量（统一由末尾 set_device_activation 提交）
+                    let key = format!("{app_str}:{cat}");
+                    if !activation.omo_current.contains_key(&key) {
+                        activation.omo_current.insert(key, id);
+                    }
+                }
+            }
+
+            // --- providers.in_failover_queue → failover_queue ---
+            // 仅回填本地尚无记录的 app
+            if Self::has_column(conn, "providers", "in_failover_queue")? {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT DISTINCT app_type FROM providers WHERE in_failover_queue = 1",
+                    )
+                    .map_err(|e| AppError::Database(e.to_string()))?;
+                let apps_with_queue: Vec<String> = stmt
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .map_err(|e| AppError::Database(e.to_string()))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| AppError::Database(e.to_string()))?;
+                drop(stmt);
+
+                for app_str in apps_with_queue {
+                    if activation.failover_queue.contains_key(&app_str) {
+                        continue; // 本地已有，不覆盖
+                    }
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT id FROM providers
+                             WHERE app_type = ?1 AND in_failover_queue = 1
+                             ORDER BY COALESCE(sort_index, 999999), created_at ASC, id ASC",
+                        )
+                        .map_err(|e| AppError::Database(e.to_string()))?;
+                    let ids: Vec<String> = stmt
+                        .query_map(rusqlite::params![app_str], |row| row.get::<_, String>(0))
+                        .map_err(|e| AppError::Database(e.to_string()))?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| AppError::Database(e.to_string()))?;
+                    drop(stmt);
+                    if !ids.is_empty() {
+                        activation.failover_queue.insert(app_str, ids);
+                    }
+                }
+            }
+        }
+
+        // --- mcp_servers.enabled_* → mcp_apps ---
+        if Self::table_exists(conn, "mcp_servers")?
+            && Self::has_column(conn, "mcp_servers", "enabled_claude")?
+        {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, enabled_claude, enabled_codex, enabled_gemini, enabled_opencode, enabled_hermes
+                     FROM mcp_servers",
+                )
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            let rows: Vec<(String, bool, bool, bool, bool, bool)> = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                })
+                .map_err(|e| AppError::Database(e.to_string()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            drop(stmt);
+            for (id, claude, codex, gemini, opencode, hermes) in rows {
+                if activation.mcp_apps.contains_key(&id) {
+                    continue; // 本地已有，不覆盖
+                }
+                let flags = AppFlags {
+                    claude,
+                    codex,
+                    gemini,
+                    opencode,
+                    hermes,
+                };
+                if flags.claude || flags.codex || flags.gemini || flags.opencode || flags.hermes {
+                    activation.mcp_apps.insert(id, flags);
+                }
+            }
+        }
+
+        // --- skills.enabled_* → skill_apps ---
+        if Self::table_exists(conn, "skills")?
+            && Self::has_column(conn, "skills", "enabled_claude")?
+        {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, enabled_claude, enabled_codex, enabled_gemini, enabled_opencode, enabled_hermes
+                     FROM skills",
+                )
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            let rows: Vec<(String, bool, bool, bool, bool, bool)> = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                })
+                .map_err(|e| AppError::Database(e.to_string()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            drop(stmt);
+            for (id, claude, codex, gemini, opencode, hermes) in rows {
+                if activation.skill_apps.contains_key(&id) {
+                    continue; // 本地已有，不覆盖
+                }
+                let flags = AppFlags {
+                    claude,
+                    codex,
+                    gemini,
+                    opencode,
+                    hermes,
+                };
+                if flags.claude || flags.codex || flags.gemini || flags.opencode || flags.hermes {
+                    activation.skill_apps.insert(id, flags);
+                }
+            }
+        }
+
+        // 一次性写回 device_activation（failover/mcp/skill）
+        let _ = crate::settings::set_device_activation(activation);
+
         Ok(())
     }
 

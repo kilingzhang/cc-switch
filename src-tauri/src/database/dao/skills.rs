@@ -22,41 +22,69 @@ impl Database {
         let mut stmt = conn
             .prepare(
                 "SELECT id, name, description, directory, repo_owner, repo_name, repo_branch,
-                        readme_url, enabled_claude, enabled_codex, enabled_gemini, enabled_opencode,
-                        enabled_hermes, installed_at, content_hash, updated_at
+                        readme_url, installed_at, content_hash, updated_at
                  FROM skills ORDER BY name ASC",
             )
             .map_err(|e| AppError::Database(e.to_string()))?;
 
         let skill_iter = stmt
             .query_map([], |row| {
-                Ok(InstalledSkill {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    description: row.get(2)?,
-                    directory: row.get(3)?,
-                    repo_owner: row.get(4)?,
-                    repo_name: row.get(5)?,
-                    repo_branch: row.get(6)?,
-                    readme_url: row.get(7)?,
-                    apps: SkillApps {
-                        claude: row.get(8)?,
-                        codex: row.get(9)?,
-                        gemini: row.get(10)?,
-                        opencode: row.get(11)?,
-                        hermes: row.get(12)?,
-                    },
-                    installed_at: row.get(13)?,
-                    content_hash: row.get(14)?,
-                    updated_at: row.get::<_, i64>(15).unwrap_or(0),
-                })
+                Ok((
+                    row.get::<_, String>(0)?,       // id
+                    row.get::<_, String>(1)?,       // name
+                    row.get::<_, Option<String>>(2)?, // description
+                    row.get::<_, String>(3)?,       // directory
+                    row.get::<_, Option<String>>(4)?, // repo_owner
+                    row.get::<_, Option<String>>(5)?, // repo_name
+                    row.get::<_, Option<String>>(6)?, // repo_branch
+                    row.get::<_, Option<String>>(7)?, // readme_url
+                    row.get::<_, i64>(8)?,           // installed_at
+                    row.get::<_, Option<String>>(9)?, // content_hash
+                    row.get::<_, i64>(10).unwrap_or(0), // updated_at
+                ))
             })
             .map_err(|e| AppError::Database(e.to_string()))?;
 
         let mut skills = IndexMap::new();
         for skill_res in skill_iter {
-            let skill = skill_res.map_err(|e| AppError::Database(e.to_string()))?;
-            skills.insert(skill.id.clone(), skill);
+            let (
+                id,
+                name,
+                description,
+                directory,
+                repo_owner,
+                repo_name,
+                repo_branch,
+                readme_url,
+                installed_at,
+                content_hash,
+                updated_at,
+            ) = skill_res.map_err(|e| AppError::Database(e.to_string()))?;
+            // v12: per-app 启用标志从本地 settings 读取
+            let flags = crate::settings::get_skill_apps(&id);
+            skills.insert(
+                id.clone(),
+                InstalledSkill {
+                    id,
+                    name,
+                    description,
+                    directory,
+                    repo_owner,
+                    repo_name,
+                    repo_branch,
+                    readme_url,
+                    apps: SkillApps {
+                        claude: flags.claude,
+                        codex: flags.codex,
+                        gemini: flags.gemini,
+                        opencode: flags.opencode,
+                        hermes: flags.hermes,
+                    },
+                    installed_at,
+                    content_hash,
+                    updated_at,
+                },
+            );
         }
         Ok(skills)
     }
@@ -64,40 +92,65 @@ impl Database {
     /// 获取单个已安装的 Skill
     pub fn get_installed_skill(&self, id: &str) -> Result<Option<InstalledSkill>, AppError> {
         let conn = lock_conn!(self.conn);
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, name, description, directory, repo_owner, repo_name, repo_branch,
-                        readme_url, enabled_claude, enabled_codex, enabled_gemini, enabled_opencode,
-                        enabled_hermes, installed_at, content_hash, updated_at
+        let result = conn.query_row(
+            "SELECT id, name, description, directory, repo_owner, repo_name, repo_branch,
+                        readme_url, installed_at, content_hash, updated_at
                  FROM skills WHERE id = ?1",
-            )
-            .map_err(|e| AppError::Database(e.to_string()))?;
-
-        let result = stmt.query_row([id], |row| {
-            Ok(InstalledSkill {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                description: row.get(2)?,
-                directory: row.get(3)?,
-                repo_owner: row.get(4)?,
-                repo_name: row.get(5)?,
-                repo_branch: row.get(6)?,
-                readme_url: row.get(7)?,
-                apps: SkillApps {
-                    claude: row.get(8)?,
-                    codex: row.get(9)?,
-                    gemini: row.get(10)?,
-                    opencode: row.get(11)?,
-                    hermes: row.get(12)?,
-                },
-                installed_at: row.get(13)?,
-                content_hash: row.get(14)?,
-                updated_at: row.get::<_, i64>(15).unwrap_or(0),
-            })
-        });
+            [id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, i64>(10).unwrap_or(0),
+                ))
+            },
+        );
 
         match result {
-            Ok(skill) => Ok(Some(skill)),
+            Ok((
+                sid,
+                name,
+                description,
+                directory,
+                repo_owner,
+                repo_name,
+                repo_branch,
+                readme_url,
+                installed_at,
+                content_hash,
+                updated_at,
+            )) => {
+                // v12: per-app 启用标志从本地 settings 读取
+                let flags = crate::settings::get_skill_apps(&sid);
+                Ok(Some(InstalledSkill {
+                    id: sid,
+                    name,
+                    description,
+                    directory,
+                    repo_owner,
+                    repo_name,
+                    repo_branch,
+                    readme_url,
+                    apps: SkillApps {
+                        claude: flags.claude,
+                        codex: flags.codex,
+                        gemini: flags.gemini,
+                        opencode: flags.opencode,
+                        hermes: flags.hermes,
+                    },
+                    installed_at,
+                    content_hash,
+                    updated_at,
+                }))
+            }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(AppError::Database(e.to_string())),
         }
@@ -105,13 +158,13 @@ impl Database {
 
     /// 保存 Skill（添加或更新）
     pub fn save_skill(&self, skill: &InstalledSkill) -> Result<(), AppError> {
+        // v12: 定义写 DB，per-app 启用写本地 settings。
         let conn = lock_conn!(self.conn);
         conn.execute(
             "INSERT OR REPLACE INTO skills
              (id, name, description, directory, repo_owner, repo_name, repo_branch,
-              readme_url, enabled_claude, enabled_codex, enabled_gemini, enabled_opencode, enabled_hermes,
-              installed_at, content_hash, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+              readme_url, installed_at, content_hash, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 skill.id,
                 skill.name,
@@ -121,17 +174,23 @@ impl Database {
                 skill.repo_name,
                 skill.repo_branch,
                 skill.readme_url,
-                skill.apps.claude,
-                skill.apps.codex,
-                skill.apps.gemini,
-                skill.apps.opencode,
-                skill.apps.hermes,
                 skill.installed_at,
                 skill.content_hash,
                 skill.updated_at,
             ],
         )
         .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // 启用标志写入 settings
+        let flags = crate::settings::AppFlags {
+            claude: skill.apps.claude,
+            codex: skill.apps.codex,
+            gemini: skill.apps.gemini,
+            opencode: skill.apps.opencode,
+            hermes: skill.apps.hermes,
+        };
+        crate::settings::set_skill_apps(&skill.id, flags)?;
+
         Ok(())
     }
 
@@ -141,6 +200,10 @@ impl Database {
         let affected = conn
             .execute("DELETE FROM skills WHERE id = ?1", params![id])
             .map_err(|e| AppError::Database(e.to_string()))?;
+        // 同步清理本地 settings 中的激活记录
+        if affected > 0 {
+            let _ = crate::settings::remove_skill_apps(id);
+        }
         Ok(affected > 0)
     }
 
@@ -154,14 +217,21 @@ impl Database {
 
     /// 更新 Skill 的应用启用状态
     pub fn update_skill_apps(&self, id: &str, apps: &SkillApps) -> Result<bool, AppError> {
-        let conn = lock_conn!(self.conn);
-        let affected = conn
-            .execute(
-                "UPDATE skills SET enabled_claude = ?1, enabled_codex = ?2, enabled_gemini = ?3, enabled_opencode = ?4, enabled_hermes = ?5 WHERE id = ?6",
-                params![apps.claude, apps.codex, apps.gemini, apps.opencode, apps.hermes, id],
-            )
-            .map_err(|e| AppError::Database(e.to_string()))?;
-        Ok(affected > 0)
+        // v12: 启用状态存于本地 settings。
+        let exists = self.get_installed_skill(id)?.is_some();
+        if exists {
+            let flags = crate::settings::AppFlags {
+                claude: apps.claude,
+                codex: apps.codex,
+                gemini: apps.gemini,
+                opencode: apps.opencode,
+                hermes: apps.hermes,
+            };
+            crate::settings::set_skill_apps(id, flags)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     /// 更新 Skill 的内容哈希和更新时间
