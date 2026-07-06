@@ -1,0 +1,127 @@
+name: Sync upstream main
+
+# 每天定时检查 upstream/main（farion1231/cc-switch）是否有新提交，
+# 自动合并到 feature/07：
+# - 无冲突：自动 merge + push
+# - 有冲突：自动开 PR，通知人工解决
+#
+# 触发方式：
+# 1. schedule: 每天 UTC 18:00（北京时间凌晨 2:00）
+# 2. workflow_dispatch: 手动在 Actions 页面触发
+#
+# 权限要求：
+# - workflows 默认用 GITHUB_TOKEN，但它的 push 不会触发其他 workflow。
+#   如需 push 后触发 CI，请用 PAT（创建后加为仓库 secret SYNC_TOKEN）。
+#   不配 SYNC_TOKEN 时回退到默认 GITHUB_TOKEN（仅 push 不触发 CI）。
+
+on:
+  schedule:
+    - cron: "0 18 * * *" # UTC 18:00 = 北京时间 02:00
+  workflow_dispatch:
+    inputs:
+      target_branch:
+        description: "目标分支（默认 feature/07）"
+        required: false
+        default: "feature/07"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Resolve target branch
+        id: vars
+        run: |
+          TARGET="${{ github.event.inputs.target_branch || 'feature/07' }}"
+          echo "target_branch=$TARGET" >> $GITHUB_OUTPUT
+          echo "Will sync upstream/main → $TARGET"
+
+      - name: Checkout target branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.vars.outputs.target_branch }}
+          fetch-depth: 0 # 完整历史，merge 需要
+          token: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Add upstream remote & fetch
+        run: |
+          git remote add upstream https://github.com/farion1231/cc-switch.git
+          git fetch upstream main
+          echo "## Upstream commits not in ${{ steps.vars.outputs.target_branch }}:" >> $GITHUB_STEP_SUMMARY
+          git log --oneline ${{ steps.vars.outputs.target_branch }}..upstream/main >> $GITHUB_STEP_SUMMARY || true
+
+      - name: Check if sync needed
+        id: check
+        run: |
+          BEHIND=$(git rev-list --count HEAD..upstream/main)
+          echo "behind=$BEHIND" >> $GITHUB_OUTPUT
+          echo "Behind upstream/main by $BEHIND commits"
+          if [ "$BEHIND" -eq 0 ]; then
+            echo "✅ Already up to date, nothing to sync." >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Attempt merge
+        id: merge
+        if: steps.check.outputs.behind != '0'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git merge upstream/main --no-edit; then
+            echo "merge_ok=true" >> $GITHUB_OUTPUT
+            echo "✅ Merge succeeded without conflicts." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "merge_ok=false" >> $GITHUB_OUTPUT
+            echo "⚠️ Merge has conflicts, will open a PR." >> $GITHUB_STEP_SUMMARY
+            # abort 以便后续创建 conflict 分支时状态干净
+            git merge --abort || true
+          fi
+
+      - name: Push (no conflict)
+        if: steps.merge.outputs.merge_ok == 'true'
+        run: |
+          git push origin ${{ steps.vars.outputs.target_branch }}
+          echo "🚀 Pushed merged ${{ steps.vars.outputs.target_branch }}." >> $GITHUB_STEP_SUMMARY
+
+      - name: Create PR (on conflict)
+        if: steps.merge.outputs.merge_ok == 'false'
+        run: |
+          TARGET="${{ steps.vars.outputs.target_branch }}"
+          DATE=$(date -u +"%Y-%m-%d")
+          PR_BRANCH="sync/upstream-main/$DATE"
+          # 基于目标分支创建同步分支，在上面做 merge（保留冲突状态供 PR 解决）
+          git checkout -b "$PR_BRANCH"
+          git merge upstream/main --no-edit || true
+          # 即使有冲突也 push（force-with-lease 安全），GitHub 会识别为可解决冲突的 PR
+          git push --force-with-lease origin "$PR_BRANCH"
+          gh pr create \
+            --base "$TARGET" \
+            --head "$PR_BRANCH" \
+            --title "chore: sync upstream/main ($DATE) — 需手动解决冲突" \
+            --body "$(cat <<BODY
+          自动同步检测到 \`upstream/main\` 有新提交，但合并到 \`$TARGET\` 时产生冲突。
+
+          ## 需要手动解决的冲突
+
+          请在本地或 GitHub 网页端解决冲突后合并此 PR。
+
+          \`\`\`bash
+          git fetch origin
+          git checkout $PR_BRANCH
+          git merge upstream/main
+          # 解决冲突...
+          git add . && git commit
+          git push
+          \`\`\`
+
+          上游新增提交见 run summary。
+          BODY
+          )" \
+            --label "sync" 2>/dev/null || true
+          echo "📋 Opened conflict PR against $TARGET." >> $GITHUB_STEP_SUMMARY
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
