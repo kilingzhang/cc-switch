@@ -21,6 +21,7 @@ pub fn launch_terminal(
         "kitty" => launch_kitty(command, cwd),
         "wezterm" => launch_wezterm(command, cwd),
         "kaku" => launch_kaku(command, cwd),
+        "otty" => launch_otty(command, cwd),
         "alacritty" => launch_alacritty(command, cwd),
         #[cfg(unix)]
         "warp" => launch_warp(command, cwd),
@@ -242,6 +243,31 @@ fn launch_warp(command: &str, cwd: Option<&str>) -> Result<(), String> {
         Ok(())
     } else {
         Err("Failed to launch Warp.".to_string())
+    }
+}
+
+fn launch_otty(command: &str, cwd: Option<&str>) -> Result<(), String> {
+    // Otty exposes the same `do script` AppleScript verb as iTerm2:
+    // with no `in` target it opens a new window and runs the command there.
+    let full_command = build_shell_command(command, cwd);
+    let escaped = escape_osascript(&full_command);
+    let script = format!(
+        r#"tell application "Otty"
+    activate
+    do script "{escaped}"
+end tell"#
+    );
+
+    let status = Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .status()
+        .map_err(|e| format!("Failed to launch Otty: {e}"))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err("Otty command execution failed".to_string())
     }
 }
 
