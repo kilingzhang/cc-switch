@@ -134,7 +134,8 @@ fn export_local_rollups_sql(db: &Database, device_id: &str) -> Result<Vec<u8>, A
         .prepare(
             "SELECT date, app_type, provider_id, model, request_model, pricing_model, device_id,
                     request_count, success_count, input_tokens, output_tokens,
-                    cache_read_tokens, cache_creation_tokens, total_cost_usd, avg_latency_ms
+                    cache_read_tokens, cache_creation_tokens, total_cost_usd,
+                    CAST(avg_latency_ms AS INTEGER) AS avg_latency_ms
              FROM usage_daily_rollups
              WHERE device_id = ?1 OR (device_id = '' AND ?2 = '')",
         )
@@ -365,4 +366,38 @@ pub async fn list_remote_devices(
     let creds = creds_for(settings);
     let registry = fetch_device_registry(&creds, &settings.remote_root).await?;
     Ok(registry.devices.values().cloned().collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn export_local_rollups_sql_accepts_real_avg_latency() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        {
+            let conn = crate::database::lock_conn!(db.conn);
+            conn.execute(
+                "INSERT INTO usage_daily_rollups
+                 (date, app_type, provider_id, model, request_model, pricing_model, device_id,
+                  request_count, success_count, input_tokens, output_tokens,
+                  cache_read_tokens, cache_creation_tokens, total_cost_usd, avg_latency_ms)
+                 VALUES
+                 ('2026-07-07', 'codex', 'p1', 'm1', '', '', 'device-a',
+                  2, 2, 10, 20, 0, 0, '0.01', 12.5)",
+                [],
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        }
+
+        let sql = export_local_rollups_sql(&db, "device-a")?;
+        let sql = String::from_utf8(sql)
+            .map_err(|e| AppError::Database(format!("invalid utf8: {e}")))?;
+
+        assert!(
+            sql.contains("'2026-07-07','codex','p1','m1','','','device-a',2,2,10,20,0,0,'0.01',12"),
+            "export should cast REAL avg_latency_ms to an integer literal, got: {sql}"
+        );
+        Ok(())
+    }
 }

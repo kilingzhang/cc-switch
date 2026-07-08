@@ -137,9 +137,11 @@ impl Database {
                 COALESCE(old.cache_creation_tokens, 0) + new_cc,
                 CAST(COALESCE(CAST(old.total_cost_usd AS REAL), 0) + new_cost AS TEXT),
                 CASE WHEN COALESCE(old.request_count, 0) + new_req > 0
-                    THEN (COALESCE(old.avg_latency_ms, 0) * COALESCE(old.request_count, 0)
-                          + new_lat * new_req)
-                         / (COALESCE(old.request_count, 0) + new_req)
+                    THEN CAST(ROUND(
+                        (COALESCE(old.avg_latency_ms, 0) * COALESCE(old.request_count, 0)
+                         + new_lat * new_req)
+                        / (COALESCE(old.request_count, 0) + new_req)
+                    ) AS INTEGER)
                     ELSE 0 END
             FROM (
                 SELECT
