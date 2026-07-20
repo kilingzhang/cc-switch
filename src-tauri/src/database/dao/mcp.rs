@@ -59,6 +59,7 @@ impl Database {
                         claude: flags.claude,
                         codex: flags.codex,
                         gemini: flags.gemini,
+                        grokbuild: flags.grokbuild,
                         opencode: flags.opencode,
                         hermes: flags.hermes,
                     },
@@ -100,6 +101,7 @@ impl Database {
             claude: server.apps.claude,
             codex: server.apps.codex,
             gemini: server.apps.gemini,
+            grokbuild: server.apps.grokbuild,
             opencode: server.apps.opencode,
             hermes: server.apps.hermes,
         };

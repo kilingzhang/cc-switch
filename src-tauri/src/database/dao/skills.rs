@@ -77,6 +77,7 @@ impl Database {
                         claude: flags.claude,
                         codex: flags.codex,
                         gemini: flags.gemini,
+                        grokbuild: flags.grokbuild,
                         opencode: flags.opencode,
                         hermes: flags.hermes,
                     },
@@ -143,6 +144,7 @@ impl Database {
                         claude: flags.claude,
                         codex: flags.codex,
                         gemini: flags.gemini,
+                        grokbuild: flags.grokbuild,
                         opencode: flags.opencode,
                         hermes: flags.hermes,
                     },
@@ -186,6 +188,7 @@ impl Database {
             claude: skill.apps.claude,
             codex: skill.apps.codex,
             gemini: skill.apps.gemini,
+            grokbuild: skill.apps.grokbuild,
             opencode: skill.apps.opencode,
             hermes: skill.apps.hermes,
         };
@@ -224,6 +227,7 @@ impl Database {
                 claude: apps.claude,
                 codex: apps.codex,
                 gemini: apps.gemini,
+                grokbuild: apps.grokbuild,
                 opencode: apps.opencode,
                 hermes: apps.hermes,
             };

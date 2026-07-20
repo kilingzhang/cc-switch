@@ -159,6 +159,7 @@ impl Database {
                     claude: server.apps.claude,
                     codex: server.apps.codex,
                     gemini: server.apps.gemini,
+                    grokbuild: false,
                     opencode: false, // 旧 config.json 不含 opencode/hermes，保持 false
                     hermes: false,
                 };
@@ -166,6 +167,7 @@ impl Database {
                 let unset = !existing.claude
                     && !existing.codex
                     && !existing.gemini
+                    && !existing.grokbuild
                     && !existing.opencode
                     && !existing.hermes;
                 if unset {

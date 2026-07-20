@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { UsageHero } from "./UsageHero";
 import { UsageTrendChart } from "./UsageTrendChart";
@@ -49,14 +49,24 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 const APP_FILTER_OPTIONS: AppTypeFilter[] = ["all", ...KNOWN_APP_TYPES];
 
-// 0 表示关闭自动刷新（refetchInterval=false）
+const DEFAULT_REFRESH_INTERVAL_MS = 30000;
 const REFRESH_INTERVAL_OPTIONS_MS = [0, 5000, 10000, 30000, 60000] as const;
+type RefreshIntervalOption = (typeof REFRESH_INTERVAL_OPTIONS_MS)[number];
+
+const isRefreshIntervalOption = (
+  value: number | undefined,
+): value is RefreshIntervalOption =>
+  REFRESH_INTERVAL_OPTIONS_MS.includes(value as RefreshIntervalOption);
+
+const normalizeRefreshInterval = (value: number | undefined) =>
+  isRefreshIntervalOption(value) ? value : DEFAULT_REFRESH_INTERVAL_MS;
 
 // 与 AppSwitcher 的 appIconName 保持一致（codex 复用 openai 图标）
 const APP_FILTER_ICON: Record<AppType, string> = {
   claude: "claude",
   codex: "openai",
   gemini: "gemini",
+  grokbuild: "grok",
   opencode: "opencode",
 };
 
@@ -67,7 +77,15 @@ const encodeOptionValue = (name: string) => `${DYNAMIC_OPTION_PREFIX}${name}`;
 const decodeOptionValue = (value: string) =>
   value === "all" ? undefined : value.slice(DYNAMIC_OPTION_PREFIX.length);
 
-export function UsageDashboard() {
+interface UsageDashboardProps {
+  refreshIntervalMs?: number;
+  onRefreshIntervalChange?: (next: number) => Promise<boolean> | boolean | void;
+}
+
+export function UsageDashboard({
+  refreshIntervalMs: savedRefreshIntervalMs,
+  onRefreshIntervalChange,
+}: UsageDashboardProps = {}) {
   const { t, i18n } = useTranslation();
   const queryClient = useQueryClient();
   const [range, setRange] = useState<UsageRangeSelection>({ preset: "today" });
@@ -77,7 +95,13 @@ export function UsageDashboard() {
   );
   const [model, setModel] = useState<string | undefined>(undefined);
   const [deviceId, setDeviceId] = useState<string | undefined>(undefined);
-  const [refreshIntervalMs, setRefreshIntervalMs] = useState(30000);
+  const [refreshIntervalMs, setRefreshIntervalMs] = useState(() =>
+    normalizeRefreshInterval(savedRefreshIntervalMs),
+  );
+
+  useEffect(() => {
+    setRefreshIntervalMs(normalizeRefreshInterval(savedRefreshIntervalMs));
+  }, [savedRefreshIntervalMs]);
 
   // v12+: 跨设备用量同步的远端设备列表（用于设备筛选下拉）。
   // best-effort：远端未配置或无设备时静默失败，下拉只显示「全部」。
@@ -108,9 +132,23 @@ export function UsageDashboard() {
   // usage 查询，实现实时刷新（仅在 Dashboard 挂载时生效，离开页面自动取消监听）
   useUsageEventBridge();
 
-  const changeRefreshInterval = (next: number) => {
-    setRefreshIntervalMs(next);
+  const changeRefreshInterval = async (next: number) => {
+    const normalized = normalizeRefreshInterval(next);
+    const previous = refreshIntervalMs;
+    setRefreshIntervalMs(normalized);
     queryClient.invalidateQueries({ queryKey: usageKeys.all });
+    try {
+      const saved = await onRefreshIntervalChange?.(normalized);
+      if (saved === false) {
+        setRefreshIntervalMs(previous);
+      }
+    } catch (error) {
+      console.error(
+        "[UsageDashboard] Failed to persist refresh interval",
+        error,
+      );
+      setRefreshIntervalMs(previous);
+    }
   };
 
   const language = i18n.resolvedLanguage || i18n.language || "en";

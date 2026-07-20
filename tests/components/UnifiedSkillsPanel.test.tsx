@@ -134,6 +134,19 @@ describe("UnifiedSkillsPanel", () => {
       expect(screen.getByText("Shared Skill")).toBeInTheDocument();
       expect(screen.getByText("/tmp/shared-skill")).toBeInTheDocument();
     });
+
+    await act(async () => {
+      screen.getByText("skills.importSelected").click();
+    });
+
+    await waitFor(() => {
+      expect(importSkillsMock).toHaveBeenCalledWith([
+        {
+          directory: "shared-skill",
+          apps: expect.objectContaining({ grokbuild: true }),
+        },
+      ]);
+    });
   });
 
   it("does not select scanned skills by default", async () => {
